@@ -253,7 +253,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
 
             PassMode::Direct(_) | PassMode::Pair(..) => {
                 let op =
-                    self.codegen_consume(&mut bx, &mir::Place::RETURN_PLACE.as_ref());
+                    self.codegen_consume(&mut bx, &mir::Place::return_place().as_ref());
                 if let Ref(llval, _, align) = op.val {
                     bx.load(llval, align)
                 } else {
@@ -612,7 +612,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                                     kind: StaticKind::Promoted(promoted),
                                     ty,
                                 }),
-                                projection: None,
+                                projection: box [],
                             }
                         ) |
                         mir::Operand::Move(
@@ -621,7 +621,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                                     kind: StaticKind::Promoted(promoted),
                                     ty,
                                 }),
-                                projection: None,
+                                projection: box [],
                             }
                         ) => {
                             let param_env = ty::ParamEnv::reveal_all();
@@ -1104,7 +1104,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
         }
         let dest = if let mir::Place {
             base: mir::PlaceBase::Local(index),
-            projection: None,
+            projection: box [],
         } = *dest {
             match self.locals[index] {
                 LocalRef::Place(dest) => dest,
@@ -1165,7 +1165,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
     ) {
         if let mir::Place {
             base: mir::PlaceBase::Local(index),
-            projection: None,
+            projection: box [],
         } = *dst {
             match self.locals[index] {
                 LocalRef::Place(place) => self.codegen_transmute_into(bx, src, place),

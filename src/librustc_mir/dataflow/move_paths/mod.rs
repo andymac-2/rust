@@ -240,23 +240,21 @@ impl MovePathLookup {
     // alternative will *not* create a MovePath on the fly for an
     // unknown place, but will rather return the nearest available
     // parent.
-    pub fn find(&self, place_ref: PlaceRef<'cx, 'tcx>) -> LookupResult {
-        place_ref.iterate(|place_base, place_projection| {
-            let mut result = match place_base {
-                PlaceBase::Local(local) => self.locals[*local],
-                PlaceBase::Static(..) => return LookupResult::Parent(None),
-            };
+    pub fn find(&self, place: PlaceRef<'cx, 'tcx>) -> LookupResult {
+        let mut result = match place.base {
+            PlaceBase::Local(local) => self.locals[*local],
+            PlaceBase::Static(..) => return LookupResult::Parent(None),
+        };
 
-            for proj in place_projection {
-                if let Some(&subpath) = self.projections.get(&(result, proj.elem.lift())) {
-                    result = subpath;
-                } else {
-                    return LookupResult::Parent(Some(result));
-                }
+        for elem in place.projection.iter() {
+            if let Some(&subpath) = self.projections.get(&(result, elem.lift())) {
+                result = subpath;
+            } else {
+                return LookupResult::Parent(Some(result));
             }
+        }
 
-            LookupResult::Exact(result)
-        })
+        LookupResult::Exact(result)
     }
 
     pub fn find_local(&self, local: Local) -> MovePathIndex {
@@ -320,7 +318,7 @@ impl<'tcx> MoveData<'tcx> {
             let path = &self.move_paths[mpi];
             if let Place {
                 base: PlaceBase::Local(l),
-                projection: None,
+                projection: box [],
             } = path.place { return Some(l); }
             if let Some(parent) = path.parent { mpi = parent; continue } else { return None }
         }
