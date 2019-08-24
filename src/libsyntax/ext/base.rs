@@ -11,6 +11,7 @@ use crate::ptr::P;
 use crate::symbol::{kw, sym, Ident, Symbol};
 use crate::{ThinVec, MACRO_ARGUMENTS};
 use crate::tokenstream::{self, TokenStream, TokenTree};
+use crate::visit::Visitor;
 
 use errors::{DiagnosticBuilder, DiagnosticId};
 use smallvec::{smallvec, SmallVec};
@@ -69,6 +70,17 @@ impl Annotatable {
             Annotatable::ForeignItem(ref foreign_item) => foreign_item.span,
             Annotatable::Stmt(ref stmt) => stmt.span,
             Annotatable::Expr(ref expr) => expr.span,
+        }
+    }
+
+    pub fn visit_with<'a, V: Visitor<'a>>(&'a self, visitor: &mut V) {
+        match self {
+            Annotatable::Item(item) => visitor.visit_item(item),
+            Annotatable::TraitItem(trait_item) => visitor.visit_trait_item(trait_item),
+            Annotatable::ImplItem(impl_item) => visitor.visit_impl_item(impl_item),
+            Annotatable::ForeignItem(foreign_item) => visitor.visit_foreign_item(foreign_item),
+            Annotatable::Stmt(stmt) => visitor.visit_stmt(stmt),
+            Annotatable::Expr(expr) => visitor.visit_expr(expr),
         }
     }
 
