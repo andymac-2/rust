@@ -5,6 +5,7 @@
 #![feature(core_intrinsics)]
 #![feature(libc)]
 #![feature(rustc_diagnostic_macros)]
+#![feature(slice_patterns)]
 #![feature(stmt_expr_attributes)]
 #![feature(try_blocks)]
 #![feature(in_band_lifetimes)]

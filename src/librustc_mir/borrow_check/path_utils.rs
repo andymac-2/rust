@@ -133,20 +133,12 @@ pub(super) fn is_active<'tcx>(
 /// Determines if a given borrow is borrowing local data
 /// This is called for all Yield statements on movable generators
 pub(super) fn borrow_of_local_data(place: &Place<'_>) -> bool {
-    place.iterate(|place_base, place_projection| {
-        match place_base {
-            PlaceBase::Static(..) => return false,
-            PlaceBase::Local(..) => {},
-        }
+    match place.base {
+        PlaceBase::Static(..) => return false,
+        PlaceBase::Local(..) => {},
+    }
 
-        for proj in place_projection {
-            // Reborrow of already borrowed data is ignored
-            // Any errors will be caught on the initial borrow
-            if proj.elem == ProjectionElem::Deref {
-                return false;
-            }
-        }
-
-        true
-    })
+    // Reborrow of already borrowed data is ignored
+    // Any errors will be caught on the initial borrow
+    place.projection.iter().all(|elem| *elem != ProjectionElem::Deref)
 }

@@ -184,26 +184,28 @@ trait Qualif {
         cx: &ConstCx<'_, 'tcx>,
         place: PlaceRef<'_, 'tcx>,
     ) -> bool {
-        let proj = place.projection.as_ref().unwrap();
+        if let [proj_base @ .., elem] = place.projection {
+            let base_qualif = Self::in_place(cx, PlaceRef {
+                base: place.base,
+                projection: proj_base,
+            });
+            let qualif = base_qualif && Self::mask_for_ty(
+                cx,
+                Place::ty_from(place.base, proj_base, cx.body, cx.tcx)
+                    .projection_ty(cx.tcx, elem)
+                    .ty,
+            );
+            match elem {
+                ProjectionElem::Deref |
+                ProjectionElem::Subslice { .. } |
+                ProjectionElem::Field(..) |
+                ProjectionElem::ConstantIndex { .. } |
+                ProjectionElem::Downcast(..) => qualif,
 
-        let base_qualif = Self::in_place(cx, PlaceRef {
-            base: place.base,
-            projection: &proj.base,
-        });
-        let qualif = base_qualif && Self::mask_for_ty(
-            cx,
-            Place::ty_from(place.base, &proj.base, cx.body, cx.tcx)
-                .projection_ty(cx.tcx, &proj.elem)
-                .ty,
-        );
-        match proj.elem {
-            ProjectionElem::Deref |
-            ProjectionElem::Subslice { .. } |
-            ProjectionElem::Field(..) |
-            ProjectionElem::ConstantIndex { .. } |
-            ProjectionElem::Downcast(..) => qualif,
-
-            ProjectionElem::Index(local) => qualif || Self::in_local(cx, local),
+                ProjectionElem::Index(local) => qualif || Self::in_local(cx, *local),
+            }
+        } else {
+            bug!("This should be called if projection is not empty");
         }
     }
 
@@ -218,24 +220,24 @@ trait Qualif {
         match place {
             PlaceRef {
                 base: PlaceBase::Local(local),
-                projection: None,
+                projection: [],
             } => Self::in_local(cx, *local),
             PlaceRef {
                 base: PlaceBase::Static(box Static {
                     kind: StaticKind::Promoted(_),
                     ..
                 }),
-                projection: None,
+                projection: [],
             } => bug!("qualifying already promoted MIR"),
             PlaceRef {
                 base: PlaceBase::Static(static_),
-                projection: None,
+                projection: [],
             } => {
                 Self::in_static(cx, static_)
             },
             PlaceRef {
                 base: _,
-                projection: Some(_),
+                projection: [.., _],
             } => Self::in_projection(cx, place),
         }
     }
@@ -286,13 +288,13 @@ trait Qualif {
 
             Rvalue::Ref(_, _, ref place) => {
                 // Special-case reborrows to be more like a copy of the reference.
-                if let Some(ref proj) = place.projection {
-                    if let ProjectionElem::Deref = proj.elem {
-                        let base_ty = Place::ty_from(&place.base, &proj.base, cx.body, cx.tcx).ty;
+                if let box [proj_base @ .., elem] = &place.projection {
+                    if ProjectionElem::Deref == *elem {
+                        let base_ty = Place::ty_from(&place.base, proj_base, cx.body, cx.tcx).ty;
                         if let ty::Ref(..) = base_ty.sty {
                             return Self::in_place(cx, PlaceRef {
                                 base: &place.base,
-                                projection: &proj.base,
+                                projection: proj_base,
                             });
                         }
                     }
@@ -450,30 +452,32 @@ impl Qualif for IsNotPromotable {
         cx: &ConstCx<'_, 'tcx>,
         place: PlaceRef<'_, 'tcx>,
     ) -> bool {
-        let proj = place.projection.as_ref().unwrap();
+        if let [proj_base @ .., elem] = place.projection {
+            match elem {
+                ProjectionElem::Deref |
+                ProjectionElem::Downcast(..) => return true,
 
-        match proj.elem {
-            ProjectionElem::Deref |
-            ProjectionElem::Downcast(..) => return true,
+                ProjectionElem::ConstantIndex {..} |
+                ProjectionElem::Subslice {..} |
+                ProjectionElem::Index(_) => {}
 
-            ProjectionElem::ConstantIndex {..} |
-            ProjectionElem::Subslice {..} |
-            ProjectionElem::Index(_) => {}
-
-            ProjectionElem::Field(..) => {
-                if cx.mode == Mode::NonConstFn {
-                    let base_ty = Place::ty_from(place.base, &proj.base, cx.body, cx.tcx).ty;
-                    if let Some(def) = base_ty.ty_adt_def() {
-                        // No promotion of union field accesses.
-                        if def.is_union() {
-                            return true;
+                ProjectionElem::Field(..) => {
+                    if cx.mode == Mode::NonConstFn {
+                        let base_ty = Place::ty_from(place.base, proj_base, cx.body, cx.tcx).ty;
+                        if let Some(def) = base_ty.ty_adt_def() {
+                            // No promotion of union field accesses.
+                            if def.is_union() {
+                                return true;
+                            }
                         }
                     }
                 }
             }
-        }
 
-        Self::in_projection_structurally(cx, place)
+            Self::in_projection_structurally(cx, place)
+        } else {
+            bug!("This should be called if projection is not empty");
+        }
     }
 
     fn in_rvalue(cx: &ConstCx<'_, 'tcx>, rvalue: &Rvalue<'tcx>) -> bool {
@@ -803,23 +807,18 @@ impl<'a, 'tcx> Checker<'a, 'tcx> {
                     // We might have a candidate for promotion.
                     let candidate = Candidate::Ref(location);
                     // Start by traversing to the "base", with non-deref projections removed.
-                    let mut place_projection = &place.projection;
-                    while let Some(proj) = place_projection {
-                        if proj.elem == ProjectionElem::Deref {
-                            break;
-                        }
-                        place_projection = &proj.base;
-                    }
+                    let deref_proj =
+                        place.projection.iter().rev().find(|&elem| *elem == ProjectionElem::Deref);
 
                     debug!(
                         "qualify_consts: promotion candidate: place={:?} {:?}",
-                        place.base, place_projection
+                        place.base, deref_proj
                     );
                     // We can only promote interior borrows of promotable temps (non-temps
                     // don't get promoted anyway).
                     // (If we bailed out of the loop due to a `Deref` above, we will definitely
                     // not enter the conditional here.)
-                    if let (PlaceBase::Local(local), None) = (&place.base, place_projection) {
+                    if let (PlaceBase::Local(local), None) = (&place.base, deref_proj) {
                         if self.body.local_kind(*local) == LocalKind::Temp {
                             debug!("qualify_consts: promotion candidate: local={:?}", local);
                             // The borrowed place doesn't have `HasMutInterior`
@@ -855,27 +854,27 @@ impl<'a, 'tcx> Checker<'a, 'tcx> {
             _ => {},
         }
 
-        let mut dest_projection = &dest.projection;
+        let mut dest_projection = &dest.projection[..];
         let index = loop {
             match (&dest.base, dest_projection) {
                 // We treat all locals equal in constants
-                (&PlaceBase::Local(index), None) => break index,
+                (&PlaceBase::Local(index), []) => break index,
                 // projections are transparent for assignments
                 // we qualify the entire destination at once, even if just a field would have
                 // stricter qualification
-                (base, Some(proj)) => {
+                (base, [proj_base @ .., _]) => {
                     // Catch more errors in the destination. `visit_place` also checks various
                     // projection rules like union field access and raw pointer deref
                     let context = PlaceContext::MutatingUse(MutatingUseContext::Store);
                     self.visit_place_base(base, context, location);
-                    self.visit_projection(base, proj, context, location);
-                    dest_projection = &proj.base;
+                    self.visit_projection(base, dest_projection, context, location);
+                    dest_projection = proj_base;
                 },
                 (&PlaceBase::Static(box Static {
                     kind: StaticKind::Promoted(_),
                     ..
-                }), None) => bug!("promoteds don't exist yet during promotion"),
-                (&PlaceBase::Static(box Static{ kind: _, .. }), None) => {
+                }), []) => bug!("promoteds don't exist yet during promotion"),
+                (&PlaceBase::Static(box Static{ kind: _, .. }), []) => {
                     // Catch more errors in the destination. `visit_place` also checks that we
                     // do not try to access statics from constants or try to mutate statics
                     let context = PlaceContext::MutatingUse(MutatingUseContext::Store);
@@ -983,7 +982,7 @@ impl<'a, 'tcx> Checker<'a, 'tcx> {
                     if let StatementKind::Assign(_, box Rvalue::Repeat(
                         Operand::Move(Place {
                             base: PlaceBase::Local(index),
-                            projection: None,
+                            projection: box [],
                         }),
                         _
                     )) = self.body[bb].statements[stmt_idx].kind {
@@ -995,7 +994,7 @@ impl<'a, 'tcx> Checker<'a, 'tcx> {
                         _,
                         box Rvalue::Ref(_, _, Place {
                             base: PlaceBase::Local(index),
-                            projection: None,
+                            projection: box [],
                         })
                     ) = self.body[bb].statements[stmt_idx].kind {
                         promoted_temps.insert(index);
@@ -1081,7 +1080,7 @@ impl<'a, 'tcx> Visitor<'tcx> for Checker<'a, 'tcx> {
     fn visit_projection(
         &mut self,
         place_base: &PlaceBase<'tcx>,
-        proj: &Projection<'tcx>,
+        proj: &[PlaceElem<'tcx>],
         context: PlaceContext,
         location: Location,
     ) {
@@ -1090,62 +1089,65 @@ impl<'a, 'tcx> Visitor<'tcx> for Checker<'a, 'tcx> {
             proj, context, location,
         );
         self.super_projection(place_base, proj, context, location);
-        match proj.elem {
-            ProjectionElem::Deref => {
-                if context.is_mutating_use() {
-                    // `not_const` errors out in const contexts
-                    self.not_const()
-                }
-                let base_ty = Place::ty_from(place_base, &proj.base, self.body, self.tcx).ty;
-                match self.mode {
-                    Mode::NonConstFn => {},
-                    _ => {
-                        if let ty::RawPtr(_) = base_ty.sty {
-                            if !self.tcx.features().const_raw_ptr_deref {
-                                emit_feature_err(
-                                    &self.tcx.sess.parse_sess, sym::const_raw_ptr_deref,
-                                    self.span, GateIssue::Language,
-                                    &format!(
-                                        "dereferencing raw pointers in {}s is unstable",
-                                        self.mode,
-                                    ),
-                                );
+
+        if let [proj_base @ .., elem] = proj {
+            match elem {
+                ProjectionElem::Deref => {
+                    if context.is_mutating_use() {
+                        // `not_const` errors out in const contexts
+                        self.not_const()
+                    }
+                    let base_ty = Place::ty_from(place_base, proj_base, self.body, self.tcx).ty;
+                    match self.mode {
+                        Mode::NonConstFn => {},
+                        _ => {
+                            if let ty::RawPtr(_) = base_ty.sty {
+                                if !self.tcx.features().const_raw_ptr_deref {
+                                    emit_feature_err(
+                                        &self.tcx.sess.parse_sess, sym::const_raw_ptr_deref,
+                                        self.span, GateIssue::Language,
+                                        &format!(
+                                            "dereferencing raw pointers in {}s is unstable",
+                                            self.mode,
+                                        ),
+                                    );
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            ProjectionElem::ConstantIndex {..} |
-            ProjectionElem::Subslice {..} |
-            ProjectionElem::Field(..) |
-            ProjectionElem::Index(_) => {
-                let base_ty = Place::ty_from(place_base, &proj.base, self.body, self.tcx).ty;
-                if let Some(def) = base_ty.ty_adt_def() {
-                    if def.is_union() {
-                        match self.mode {
-                            Mode::ConstFn => {
-                                if !self.tcx.features().const_fn_union {
-                                    emit_feature_err(
-                                        &self.tcx.sess.parse_sess, sym::const_fn_union,
-                                        self.span, GateIssue::Language,
-                                        "unions in const fn are unstable",
-                                    );
-                                }
-                            },
+                ProjectionElem::ConstantIndex {..} |
+                ProjectionElem::Subslice {..} |
+                ProjectionElem::Field(..) |
+                ProjectionElem::Index(_) => {
+                    let base_ty = Place::ty_from(place_base, proj_base, self.body, self.tcx).ty;
+                    if let Some(def) = base_ty.ty_adt_def() {
+                        if def.is_union() {
+                            match self.mode {
+                                Mode::ConstFn => {
+                                    if !self.tcx.features().const_fn_union {
+                                        emit_feature_err(
+                                            &self.tcx.sess.parse_sess, sym::const_fn_union,
+                                            self.span, GateIssue::Language,
+                                            "unions in const fn are unstable",
+                                        );
+                                    }
+                                },
 
-                            | Mode::NonConstFn
-                            | Mode::Static
-                            | Mode::StaticMut
-                            | Mode::Const
-                            => {},
+                                | Mode::NonConstFn
+                                | Mode::Static
+                                | Mode::StaticMut
+                                | Mode::Const
+                                => {},
+                            }
                         }
                     }
                 }
-            }
 
-            ProjectionElem::Downcast(..) => {
-                self.not_const()
+                ProjectionElem::Downcast(..) => {
+                    self.not_const()
+                }
             }
         }
     }
@@ -1159,7 +1161,7 @@ impl<'a, 'tcx> Visitor<'tcx> for Checker<'a, 'tcx> {
                 // Mark the consumed locals to indicate later drops are noops.
                 if let Place {
                     base: PlaceBase::Local(local),
-                    projection: None,
+                    projection: box [],
                 } = *place {
                     self.cx.per_local[NeedsDrop].remove(local);
                 }
@@ -1176,11 +1178,11 @@ impl<'a, 'tcx> Visitor<'tcx> for Checker<'a, 'tcx> {
         if let Rvalue::Ref(_, kind, ref place) = *rvalue {
             // Special-case reborrows.
             let mut reborrow_place = None;
-            if let Some(ref proj) = place.projection {
-                if let ProjectionElem::Deref = proj.elem {
-                    let base_ty = Place::ty_from(&place.base, &proj.base, self.body, self.tcx).ty;
+            if let box [proj_base @ .., elem] = &place.projection {
+                if *elem == ProjectionElem::Deref {
+                    let base_ty = Place::ty_from(&place.base, proj_base, self.body, self.tcx).ty;
                     if let ty::Ref(..) = base_ty.sty {
-                        reborrow_place = Some(&proj.base);
+                        reborrow_place = Some(proj_base);
                     }
                 }
             }
@@ -1201,9 +1203,7 @@ impl<'a, 'tcx> Visitor<'tcx> for Checker<'a, 'tcx> {
                     ),
                 };
                 self.visit_place_base(&place.base, ctx, location);
-                if let Some(proj) = proj {
-                    self.visit_projection(&place.base, proj, ctx, location);
-                }
+                self.visit_projection(&place.base, proj, ctx, location);
             } else {
                 self.super_rvalue(rvalue, location);
             }
@@ -1474,7 +1474,7 @@ impl<'a, 'tcx> Visitor<'tcx> for Checker<'a, 'tcx> {
                 // conservatively, that drop elaboration will do.
                 let needs_drop = if let Place {
                     base: PlaceBase::Local(local),
-                    projection: None,
+                    projection: box [],
                 } = *place {
                     if NeedsDrop::in_local(self, local) {
                         Some(self.body.local_decls[local].source_info.span)
@@ -1707,7 +1707,7 @@ impl MirPass for QualifyAndPromoteConstants {
                     TerminatorKind::Drop {
                         location: Place {
                             base: PlaceBase::Local(index),
-                            projection: None,
+                            projection: box [],
                         },
                         target,
                         ..
