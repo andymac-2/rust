@@ -1,5 +1,4 @@
-use crate::ast::{self, ItemKind, Attribute, Mac};
-use crate::attr::{mark_used, mark_known};
+use crate::ast::{self, ItemKind, Attribute};
 use crate::errors::{Applicability, FatalError};
 use crate::ext::base::{self, *};
 use crate::ext::proc_macro_server;
@@ -7,7 +6,6 @@ use crate::parse::{self, token};
 use crate::parse::parser::PathStyle;
 use crate::symbol::sym;
 use crate::tokenstream::{self, TokenStream};
-use crate::visit::Visitor;
 
 use rustc_data_structures::sync::Lrc;
 use syntax_pos::{Span, DUMMY_SP};
@@ -111,9 +109,6 @@ impl MultiItemModifier for ProcMacroDerive {
             }
         }
 
-        // Mark attributes as known, and used.
-        MarkAttrs(&self.attrs).visit_item(&item);
-
         let token = token::Interpolated(Lrc::new(token::NtItem(item)));
         let input = tokenstream::TokenTree::token(token, DUMMY_SP).into();
 
@@ -162,21 +157,6 @@ impl MultiItemModifier for ProcMacroDerive {
 
         items
     }
-}
-
-struct MarkAttrs<'a>(&'a [ast::Name]);
-
-impl<'a> Visitor<'a> for MarkAttrs<'a> {
-    fn visit_attribute(&mut self, attr: &Attribute) {
-        if let Some(ident) = attr.ident() {
-            if self.0.contains(&ident.name) {
-                mark_used(attr);
-                mark_known(attr);
-            }
-        }
-    }
-
-    fn visit_mac(&mut self, _mac: &Mac) {}
 }
 
 pub fn is_proc_macro_attr(attr: &Attribute) -> bool {

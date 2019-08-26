@@ -10,8 +10,8 @@ use crate::resolve_imports::ImportResolver;
 use rustc::hir::def::{self, DefKind, NonMacroAttrKind};
 use rustc::middle::stability;
 use rustc::{ty, lint, span_bug};
-use syntax::ast::{self, NodeId, Ident};
-use syntax::attr::StabilityLevel;
+use syntax::ast::{self, NodeId, Ident, Mac, Attribute};
+use syntax::attr::{self, StabilityLevel};
 use syntax::edition::Edition;
 use syntax::ext::base::{self, Indeterminate, SpecialDerives};
 use syntax::ext::base::{MacroKind, SyntaxExtension};
@@ -21,6 +21,7 @@ use syntax::ext::tt::macro_rules;
 use syntax::feature_gate::{emit_feature_err, is_builtin_attr_name};
 use syntax::feature_gate::GateIssue;
 use syntax::symbol::{Symbol, kw, sym};
+use syntax::visit::Visitor;
 use syntax_pos::{Span, DUMMY_SP};
 
 use std::{mem, ptr};
@@ -52,6 +53,21 @@ pub enum LegacyScope<'a> {
     /// The scope introduced by a macro invocation that can potentially
     /// create a `macro_rules!` macro definition.
     Invocation(ExpnId),
+}
+
+struct MarkDeriveHelpers<'a>(&'a [ast::Name]);
+
+impl<'a> Visitor<'a> for MarkDeriveHelpers<'a> {
+    fn visit_attribute(&mut self, attr: &Attribute) {
+        if let Some(ident) = attr.ident() {
+            if self.0.contains(&ident.name) {
+                attr::mark_used(attr);
+                attr::mark_known(attr);
+            }
+        }
+    }
+
+    fn visit_mac(&mut self, _mac: &Mac) {}
 }
 
 // Macro namespace is separated into two sub-namespaces, one for bang macros and
@@ -164,26 +180,37 @@ impl<'a> base::Resolver for Resolver<'a> {
                 (&mac.path, MacroKind::Bang, &[][..], false),
             InvocationKind::Derive { ref path, .. } =>
                 (path, MacroKind::Derive, &[][..], false),
-            InvocationKind::DeriveContainer { ref derives, .. } => {
-                // Block expansion of derives in the container until we know whether one of them
-                // is a built-in `Copy`. Skip the resolution if there's only one derive - either
-                // it's not a `Copy` and we don't need to do anything, or it's a `Copy` and it
-                // will automatically knows about itself.
-                let mut result = Ok(None);
-                if derives.len() > 1 {
-                    for path in derives {
-                        match self.resolve_macro_path(path, Some(MacroKind::Derive),
-                                                      &parent_scope, true, force) {
-                            Ok((Some(ref ext), _)) if ext.is_derive_copy => {
+            InvocationKind::DeriveContainer { ref derives, ref item } => {
+                // Block expansion of the container until we resolve all derives in it.
+                // This is required for two reasons:
+                // - Derive helper attributes are in scope for the item to which the `#[derive]`
+                //   is applied, so they have to be produced by the container's expansion rather
+                //   than by individual derives.
+                // - Derives in the container need to know whether one of them is a built-in `Copy`.
+                // FIXME: Try to avoid repeated resolutions for derives here and in expansion.
+                let mut derive_helpers = Vec::new();
+                for path in derives {
+                    match self.resolve_macro_path(
+                        path, Some(MacroKind::Derive), &parent_scope, true, force
+                    ) {
+                        Ok((Some(ref ext), _)) => {
+                            derive_helpers.extend(&ext.helper_attrs);
+                            if ext.is_derive_copy {
                                 self.add_derives(invoc_id, SpecialDerives::COPY);
-                                return Ok(None);
                             }
-                            Err(Determinacy::Undetermined) => result = Err(Indeterminate),
-                            _ => {}
                         }
+                        Ok(_) | Err(Determinacy::Determined) => {}
+                        Err(Determinacy::Undetermined) => return Err(Indeterminate),
                     }
                 }
-                return result;
+
+                // Mark derive helpers inside this item as known and used.
+                // FIXME: This is a hack, derive helpers should be integrated with regular name
+                // resolution instead. For example, helpers introduced by a derive container
+                // can be in scope for all code produced by that container's expansion.
+                item.visit_with(&mut MarkDeriveHelpers(&derive_helpers));
+
+                return Ok(None);
             }
         };
 
