@@ -845,21 +845,26 @@ extern "rust-intrinsic" {
     ///
     /// ```
     /// let store = [0, 1, 2, 3];
-    /// let mut v_orig = store.iter().collect::<Vec<&i32>>();
+    /// let v_orig = store.iter().collect::<Vec<&i32>>();
+    ///
+    /// // clone the vector as we will reuse them later
+    /// let v_clone = v_orig.clone();
     ///
     /// // Using transmute: this is Undefined Behavior, and a bad idea.
     /// // However, it is no-copy.
     /// let v_transmuted = unsafe {
-    ///     std::mem::transmute::<Vec<&i32>, Vec<Option<&i32>>>(
-    ///         v_orig.clone())
+    ///     std::mem::transmute::<Vec<&i32>, Vec<Option<&i32>>>(v_clone)
     /// };
+    ///
+    /// let v_clone = v_orig.clone();
     ///
     /// // This is the suggested, safe way.
     /// // It does copy the entire vector, though, into a new array.
-    /// let v_collected = v_orig.clone()
-    ///                         .into_iter()
-    ///                         .map(|r| Some(r))
-    ///                         .collect::<Vec<Option<&i32>>>();
+    /// let v_collected = v_clone.into_iter()
+    ///                          .map(Some)
+    ///                          .collect::<Vec<Option<&i32>>>();
+    ///
+    /// let v_clone = v_orig.clone();
     ///
     /// // The no-copy, unsafe way, still using transmute, but not UB.
     /// // This is equivalent to the original, but safer, and reuses the
@@ -869,11 +874,12 @@ extern "rust-intrinsic" {
     /// // the original inner type (`&i32`) to the converted inner type
     /// // (`Option<&i32>`), so read the nomicon pages linked above.
     /// let v_from_raw = unsafe {
-    ///     Vec::from_raw_parts(v_orig.as_mut_ptr() as *mut Option<&i32>,
-    ///                         v_orig.len(),
-    ///                         v_orig.capacity())
+    ///     // Ensure the original vector is not dropped.
+    ///     let mut v_clone = std::mem::ManuallyDrop::new(v_clone);
+    ///     Vec::from_raw_parts(v_clone.as_mut_ptr() as *mut Option<&i32>,
+    ///                         v_clone.len(),
+    ///                         v_clone.capacity())
     /// };
-    /// std::mem::forget(v_orig);
     /// ```
     ///
     /// Implementing `split_at_mut`:
@@ -1293,38 +1299,16 @@ extern "rust-intrinsic" {
     /// The stabilized versions of this intrinsic are available on the integer
     /// primitives via the `wrapping_add` method. For example,
     /// [`std::u32::wrapping_add`](../../std/primitive.u32.html#method.wrapping_add)
-    #[cfg(boostrap_stdarch_ignore_this)]
-    pub fn overflowing_add<T>(a: T, b: T) -> T;
-    /// Returns (a - b) mod 2<sup>N</sup>, where N is the width of T in bits.
-    /// The stabilized versions of this intrinsic are available on the integer
-    /// primitives via the `wrapping_sub` method. For example,
-    /// [`std::u32::wrapping_sub`](../../std/primitive.u32.html#method.wrapping_sub)
-    #[cfg(boostrap_stdarch_ignore_this)]
-    pub fn overflowing_sub<T>(a: T, b: T) -> T;
-    /// Returns (a * b) mod 2<sup>N</sup>, where N is the width of T in bits.
-    /// The stabilized versions of this intrinsic are available on the integer
-    /// primitives via the `wrapping_mul` method. For example,
-    /// [`std::u32::wrapping_mul`](../../std/primitive.u32.html#method.wrapping_mul)
-    #[cfg(boostrap_stdarch_ignore_this)]
-    pub fn overflowing_mul<T>(a: T, b: T) -> T;
-
-    /// Returns (a + b) mod 2<sup>N</sup>, where N is the width of T in bits.
-    /// The stabilized versions of this intrinsic are available on the integer
-    /// primitives via the `wrapping_add` method. For example,
-    /// [`std::u32::wrapping_add`](../../std/primitive.u32.html#method.wrapping_add)
-    #[cfg(not(boostrap_stdarch_ignore_this))]
     pub fn wrapping_add<T>(a: T, b: T) -> T;
     /// Returns (a - b) mod 2<sup>N</sup>, where N is the width of T in bits.
     /// The stabilized versions of this intrinsic are available on the integer
     /// primitives via the `wrapping_sub` method. For example,
     /// [`std::u32::wrapping_sub`](../../std/primitive.u32.html#method.wrapping_sub)
-    #[cfg(not(boostrap_stdarch_ignore_this))]
     pub fn wrapping_sub<T>(a: T, b: T) -> T;
     /// Returns (a * b) mod 2<sup>N</sup>, where N is the width of T in bits.
     /// The stabilized versions of this intrinsic are available on the integer
     /// primitives via the `wrapping_mul` method. For example,
     /// [`std::u32::wrapping_mul`](../../std/primitive.u32.html#method.wrapping_mul)
-    #[cfg(not(boostrap_stdarch_ignore_this))]
     pub fn wrapping_mul<T>(a: T, b: T) -> T;
 
     /// Computes `a + b`, while saturating at numeric bounds.

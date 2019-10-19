@@ -13,7 +13,6 @@ use rustc_interface::interface;
 use rustc_driver::abort_on_err;
 use rustc_resolve as resolve;
 use rustc_metadata::cstore::CStore;
-use rustc_target::spec::TargetTriple;
 
 use syntax::source_map;
 use syntax::attr;
@@ -30,7 +29,7 @@ use std::rc::Rc;
 
 use crate::config::{Options as RustdocOptions, RenderOptions};
 use crate::clean;
-use crate::clean::{Clean, MAX_DEF_ID, AttributesExt};
+use crate::clean::{MAX_DEF_ID, AttributesExt};
 use crate::html::render::RenderInfo;
 
 use crate::passes;
@@ -193,6 +192,8 @@ pub fn new_handler(error_format: ErrorOutputType,
                     source_map.map(|cm| cm as _),
                     short,
                     sessopts.debugging_opts.teach,
+                    sessopts.debugging_opts.terminal_width,
+                    false,
                 ).ui_testing(ui_testing)
             )
         },
@@ -205,6 +206,7 @@ pub fn new_handler(error_format: ErrorOutputType,
                     source_map,
                     pretty,
                     json_rendered,
+                    false,
                 ).ui_testing(ui_testing)
             )
         },
@@ -228,10 +230,11 @@ pub fn run_core(options: RustdocOptions) -> (clean::Crate, RenderInfo, RenderOpt
     let RustdocOptions {
         input,
         crate_name,
+        proc_macro_crate,
         error_format,
         libs,
         externs,
-        cfgs,
+        mut cfgs,
         codegen_options,
         debugging_options,
         target,
@@ -246,6 +249,9 @@ pub fn run_core(options: RustdocOptions) -> (clean::Crate, RenderInfo, RenderOpt
         render_options,
         ..
     } = options;
+
+    // Add the rustdoc cfg into the doc build.
+    cfgs.push("rustdoc".to_string());
 
     let cpath = Some(input.clone());
     let input = Input::File(input);
@@ -292,12 +298,16 @@ pub fn run_core(options: RustdocOptions) -> (clean::Crate, RenderInfo, RenderOpt
         }
     }).collect();
 
-    let host_triple = TargetTriple::from_triple(config::host_triple());
+    let crate_types = if proc_macro_crate {
+        vec![config::CrateType::ProcMacro]
+    } else {
+        vec![config::CrateType::Rlib]
+    };
     // plays with error output here!
     let sessopts = config::Options {
         maybe_sysroot,
         search_paths: libs,
-        crate_types: vec![config::CrateType::Rlib],
+        crate_types,
         lint_opts: if !display_warnings {
             lint_opts
         } else {
@@ -306,7 +316,7 @@ pub fn run_core(options: RustdocOptions) -> (clean::Crate, RenderInfo, RenderOpt
         lint_cap: Some(lint_cap.unwrap_or_else(|| lint::Forbid)),
         cg: codegen_options,
         externs,
-        target_triple: target.unwrap_or(host_triple),
+        target_triple: target,
         // Ensure that rustdoc works even if rustc is feature-staged
         unstable_features: UnstableFeatures::Allow,
         actually_rustdoc: true,
@@ -363,7 +373,7 @@ pub fn run_core(options: RustdocOptions) -> (clean::Crate, RenderInfo, RenderOpt
             let mut renderinfo = RenderInfo::default();
             renderinfo.access_levels = access_levels;
 
-            let ctxt = DocContext {
+            let mut ctxt = DocContext {
                 tcx,
                 resolver,
                 cstore: compiler.cstore().clone(),
@@ -383,7 +393,7 @@ pub fn run_core(options: RustdocOptions) -> (clean::Crate, RenderInfo, RenderOpt
             };
             debug!("crate: {:?}", tcx.hir().krate());
 
-            let mut krate = tcx.hir().krate().clean(&ctxt);
+            let mut krate = clean::krate(&mut ctxt);
 
             fn report_deprecated_attr(name: &str, diag: &errors::Handler) {
                 let mut msg = diag.struct_warn(&format!("the `#![doc({})]` attribute is \

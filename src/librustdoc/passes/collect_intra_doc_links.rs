@@ -7,7 +7,7 @@ use rustc::ty;
 use rustc_resolve::ParentScope;
 use syntax;
 use syntax::ast::{self, Ident};
-use syntax::ext::base::SyntaxExtensionKind;
+use syntax_expand::base::SyntaxExtensionKind;
 use syntax::feature_gate::UnstableFeatures;
 use syntax::symbol::Symbol;
 use syntax_pos::DUMMY_SP;
@@ -155,7 +155,7 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
                         };
                         Ok((ty_res, Some(format!("{}.{}", out, item_name))))
                     } else {
-                        match cx.tcx.type_of(did).sty {
+                        match cx.tcx.type_of(did).kind {
                             ty::Adt(def, _) => {
                                 if let Some(item) = if def.is_enum() {
                                     def.all_fields().find(|item| item.ident.name == item_name)
@@ -237,7 +237,7 @@ impl<'a, 'tcx> DocFolder for LinkCollector<'a, 'tcx> {
         });
 
         if parent_node.is_some() {
-            debug!("got parent node for {} {:?}, id {:?}", item.type_(), item.name, item.def_id);
+            debug!("got parent node for {:?} {:?}, id {:?}", item.type_(), item.name, item.def_id);
         }
 
         let current_item = match item.inner {
@@ -465,7 +465,7 @@ fn resolution_failure(
         }
     };
     let attrs = &item.attrs;
-    let sp = span_of_attrs(attrs);
+    let sp = span_of_attrs(attrs).unwrap_or(item.source.span());
 
     let mut diag = cx.tcx.struct_span_lint_hir(
         lint::builtin::INTRA_DOC_LINK_RESOLUTION_FAILURE,
@@ -517,7 +517,7 @@ fn ambiguity_error(
         }
     };
     let attrs = &item.attrs;
-    let sp = span_of_attrs(attrs);
+    let sp = span_of_attrs(attrs).unwrap_or(item.source.span());
 
     let mut msg = format!("`{}` is ", path_str);
 
@@ -679,6 +679,7 @@ fn primitive_impl(cx: &DocContext<'_>, path_str: &str) -> Option<DefId> {
         "f32" => tcx.lang_items().f32_impl(),
         "f64" => tcx.lang_items().f64_impl(),
         "str" => tcx.lang_items().str_impl(),
+        "bool" => tcx.lang_items().bool_impl(),
         "char" => tcx.lang_items().char_impl(),
         _ => None,
     }

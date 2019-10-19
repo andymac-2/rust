@@ -4,13 +4,12 @@
 #![feature(box_syntax)]
 #![feature(core_intrinsics)]
 #![feature(libc)]
-#![feature(rustc_diagnostic_macros)]
+#![feature(slice_patterns)]
 #![feature(stmt_expr_attributes)]
 #![feature(try_blocks)]
 #![feature(in_band_lifetimes)]
 #![feature(nll)]
 #![feature(trusted_len)]
-#![feature(mem_take)]
 #![feature(associated_type_bounds)]
 
 #![recursion_limit="256"]
@@ -21,7 +20,6 @@
 
 #[macro_use] extern crate log;
 #[macro_use] extern crate rustc;
-#[macro_use] extern crate rustc_data_structures;
 #[macro_use] extern crate syntax;
 
 use std::path::PathBuf;
@@ -29,14 +27,14 @@ use rustc::dep_graph::WorkProduct;
 use rustc::session::config::{OutputFilenames, OutputType};
 use rustc::middle::lang_items::LangItem;
 use rustc::hir::def_id::CrateNum;
+use rustc::ty::query::Providers;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::sync::Lrc;
 use rustc_data_structures::svh::Svh;
 use rustc::middle::cstore::{LibSource, CrateSource, NativeLibrary};
+use rustc::middle::dependency_format::Dependencies;
 use syntax_pos::symbol::Symbol;
 
-// N.B., this module needs to be declared first so diagnostics are
-// registered before they are used.
 mod error_codes;
 
 pub mod common;
@@ -44,7 +42,6 @@ pub mod traits;
 pub mod mir;
 pub mod debuginfo;
 pub mod base;
-pub mod callee;
 pub mod glue;
 pub mod meth;
 pub mod mono_item;
@@ -144,6 +141,7 @@ pub struct CrateInfo {
     pub used_crates_dynamic: Vec<(CrateNum, LibSource)>,
     pub lang_item_to_crate: FxHashMap<LangItem, CrateNum>,
     pub missing_lang_items: FxHashMap<CrateNum, Vec<LangItem>>,
+    pub dependency_formats: Lrc<Dependencies>,
 }
 
 
@@ -159,4 +157,12 @@ pub struct CodegenResults {
     pub crate_info: CrateInfo,
 }
 
-__build_diagnostic_array! { librustc_codegen_ssa, DIAGNOSTICS }
+pub fn provide(providers: &mut Providers<'_>) {
+    crate::back::symbol_export::provide(providers);
+    crate::base::provide_both(providers);
+}
+
+pub fn provide_extern(providers: &mut Providers<'_>) {
+    crate::back::symbol_export::provide_extern(providers);
+    crate::base::provide_both(providers);
+}

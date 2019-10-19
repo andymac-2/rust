@@ -1,6 +1,3 @@
-// NO-RUSTC-WRAPPER
-#![deny(warnings, rust_2018_idioms, unused_lifetimes)]
-
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -22,6 +19,13 @@ macro_rules! t {
         match $e {
             Ok(e) => e,
             Err(e) => panic!("{} failed with {}", stringify!($e), e),
+        }
+    };
+    // it can show extra info in the second parameter
+    ($e:expr, $extra:expr) => {
+        match $e {
+            Ok(e) => e,
+            Err(e) => panic!("{} failed with {} ({:?})", stringify!($e), e, $extra),
         }
     };
 }

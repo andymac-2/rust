@@ -12,9 +12,8 @@ use rustc::ty::layout::{
 use rustc::ty::subst::SubstsRef;
 use rustc::ty::{self, Ty, TyCtxt, TypeFoldable};
 use rustc::ty::query::TyCtxtAt;
-use rustc_data_structures::indexed_vec::IndexVec;
+use rustc_index::vec::IndexVec;
 use rustc::mir::interpret::{
-    ErrorHandled,
     GlobalId, Scalar, Pointer, FrameInfo, AllocId,
     InterpResult, truncate, sign_extend,
 };
@@ -36,7 +35,7 @@ pub struct InterpCx<'mir, 'tcx, M: Machine<'mir, 'tcx>> {
     pub(crate) param_env: ty::ParamEnv<'tcx>,
 
     /// The virtual memory system.
-    pub(crate) memory: Memory<'mir, 'tcx, M>,
+    pub memory: Memory<'mir, 'tcx, M>,
 
     /// The virtual call stack.
     pub(crate) stack: Vec<Frame<'mir, 'tcx, M::PointerTag, M::FrameExtra>>,
@@ -213,16 +212,6 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     }
 
     #[inline(always)]
-    pub fn memory(&self) -> &Memory<'mir, 'tcx, M> {
-        &self.memory
-    }
-
-    #[inline(always)]
-    pub fn memory_mut(&mut self) -> &mut Memory<'mir, 'tcx, M> {
-        &mut self.memory
-    }
-
-    #[inline(always)]
     pub fn force_ptr(
         &self,
         scalar: Scalar<M::PointerTag>,
@@ -388,7 +377,7 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         if !layout.is_unsized() {
             return Ok(Some((layout.size, layout.align.abi)));
         }
-        match layout.ty.sty {
+        match layout.ty.kind {
             ty::Adt(..) | ty::Tuple(..) => {
                 // First get the size of all statically known fields.
                 // Don't use type_of::sizing_type_of because that expects t to be sized,
@@ -442,27 +431,30 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
 
                 // Issue #27023: must add any necessary padding to `size`
                 // (to make it a multiple of `align`) before returning it.
-                //
-                // Namely, the returned size should be, in C notation:
-                //
-                //   `size + ((size & (align-1)) ? align : 0)`
-                //
-                // emulated via the semi-standard fast bit trick:
-                //
-                //   `(size + (align-1)) & -align`
+                let size = size.align_to(align);
 
-                Ok(Some((size.align_to(align), align)))
+                // Check if this brought us over the size limit.
+                if size.bytes() >= self.tcx.data_layout().obj_size_bound() {
+                    throw_ub_format!("wide pointer metadata contains invalid information: \
+                        total size is bigger than largest supported object");
+                }
+                Ok(Some((size, align)))
             }
             ty::Dynamic(..) => {
                 let vtable = metadata.expect("dyn trait fat ptr must have vtable");
-                // the second entry in the vtable is the dynamic size of the object.
+                // Read size and align from vtable (already checks size).
                 Ok(Some(self.read_size_and_align_from_vtable(vtable)?))
             }
 
             ty::Slice(_) | ty::Str => {
                 let len = metadata.expect("slice fat ptr must have vtable").to_usize(self)?;
                 let elem = layout.field(self, 0)?;
-                Ok(Some((elem.size * len, elem.align.abi)))
+
+                // Make sure the slice is not too big.
+                let size = elem.size.checked_mul(len, &*self.tcx)
+                    .ok_or_else(|| err_ub_format!("invalid slice: \
+                        total size is bigger than largest supported object"))?;
+                Ok(Some((size, elem.align.abi)))
             }
 
             ty::Foreign(_) => {
@@ -669,14 +661,7 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         // Our result will later be validated anyway, and there seems no good reason
         // to have to fail early here.  This is also more consistent with
         // `Memory::get_static_alloc` which has to use `const_eval_raw` to avoid cycles.
-        let val = self.tcx.const_eval_raw(param_env.and(gid)).map_err(|err| {
-            match err {
-                ErrorHandled::Reported =>
-                    err_inval!(ReferencedConstant),
-                ErrorHandled::TooGeneric =>
-                    err_inval!(TooGeneric),
-            }
-        })?;
+        let val = self.tcx.const_eval_raw(param_env.and(gid))?;
         self.raw_const_to_mplace(val)
     }
 

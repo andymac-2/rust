@@ -8,7 +8,7 @@ use rustc::middle::privacy::AccessLevel;
 use rustc::util::nodemap::{FxHashSet, FxHashMap};
 use rustc::ty::TyCtxt;
 use syntax::ast;
-use syntax::ext::base::MacroKind;
+use syntax_expand::base::MacroKind;
 use syntax::source_map::Spanned;
 use syntax::symbol::sym;
 use syntax_pos::{self, Span};
@@ -41,7 +41,7 @@ fn def_id_to_path(
 // framework from syntax?.
 
 pub struct RustdocVisitor<'a, 'tcx> {
-    cx: &'a core::DocContext<'tcx>,
+    cx: &'a mut core::DocContext<'tcx>,
     view_item_stack: FxHashSet<hir::HirId>,
     inlining: bool,
     /// Are the current module and all of its parents public?
@@ -51,7 +51,7 @@ pub struct RustdocVisitor<'a, 'tcx> {
 
 impl<'a, 'tcx> RustdocVisitor<'a, 'tcx> {
     pub fn new(
-        cx: &'a core::DocContext<'tcx>
+        cx: &'a mut core::DocContext<'tcx>
     ) -> RustdocVisitor<'a, 'tcx> {
         // If the root is re-exported, terminate all recursion.
         let mut stack = FxHashSet::default();
@@ -84,7 +84,7 @@ impl<'a, 'tcx> RustdocVisitor<'a, 'tcx> {
         );
         module.is_crate = true;
 
-        self.cx.renderinfo.borrow_mut().exact_paths = self.exact_paths;
+        self.cx.renderinfo.get_mut().exact_paths = self.exact_paths;
 
         module
     }
@@ -292,7 +292,7 @@ impl<'a, 'tcx> RustdocVisitor<'a, 'tcx> {
                 Res::Def(DefKind::ForeignTy, did) |
                 Res::Def(DefKind::TyAlias, did) if !self_is_hidden => {
                     self.cx.renderinfo
-                        .borrow_mut()
+                        .get_mut()
                         .access_levels.map
                         .insert(did, AccessLevel::Public);
                 },
@@ -320,7 +320,7 @@ impl<'a, 'tcx> RustdocVisitor<'a, 'tcx> {
         if !self.view_item_stack.insert(res_hir_id) { return false }
 
         let ret = match tcx.hir().get(res_hir_id) {
-            Node::Item(&hir::Item { node: hir::ItemKind::Mod(ref m), .. }) if glob => {
+            Node::Item(&hir::Item { kind: hir::ItemKind::Mod(ref m), .. }) if glob => {
                 let prev = mem::replace(&mut self.inlining, true);
                 for i in &m.item_ids {
                     let i = self.cx.tcx.hir().expect_item(i.id);
@@ -361,7 +361,7 @@ impl<'a, 'tcx> RustdocVisitor<'a, 'tcx> {
             self.store_path(def_id);
         }
 
-        match item.node {
+        match item.kind {
             hir::ItemKind::ForeignMod(ref fm) => {
                 for item in &fm.items {
                     self.visit_foreign_item(item, None, om);
@@ -561,7 +561,7 @@ impl<'a, 'tcx> RustdocVisitor<'a, 'tcx> {
         om.foreigns.push(ForeignItem {
             id: item.hir_id,
             name: renamed.unwrap_or(item.ident).name,
-            kind: &item.node,
+            kind: &item.kind,
             vis: &item.vis,
             attrs: &item.attrs,
             whence: item.span

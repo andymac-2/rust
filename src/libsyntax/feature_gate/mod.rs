@@ -18,6 +18,39 @@ mod active;
 mod builtin_attrs;
 mod check;
 
+use std::fmt;
+use crate::{edition::Edition, symbol::Symbol};
+use syntax_pos::Span;
+
+#[derive(Clone, Copy)]
+pub enum State {
+    Accepted,
+    Active { set: fn(&mut Features, Span) },
+    Removed { reason: Option<&'static str> },
+    Stabilized { reason: Option<&'static str> },
+}
+
+impl fmt::Debug for State {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            State::Accepted { .. } => write!(f, "accepted"),
+            State::Active { .. } => write!(f, "active"),
+            State::Removed { .. } => write!(f, "removed"),
+            State::Stabilized { .. } => write!(f, "stabilized"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Feature {
+    state: State,
+    name: Symbol,
+    since: &'static str,
+    issue: Option<u32>,
+    edition: Option<Edition>,
+    description: &'static str,
+}
+
 pub use active::{Features, INCOMPLETE_FEATURES};
 pub use builtin_attrs::{
     AttributeGate, AttributeType, GatedCfg,
@@ -25,7 +58,7 @@ pub use builtin_attrs::{
     deprecated_attributes, is_builtin_attr,  is_builtin_attr_name,
 };
 pub use check::{
-    check_attribute, check_crate, get_features, feature_err, emit_feature_err,
+    check_crate, check_attribute, get_features, feature_err, emit_feature_err,
     Stability, GateIssue, UnstableFeatures,
     EXPLAIN_STMT_ATTR_SYNTAX, EXPLAIN_UNSIZED_TUPLE_COERCION,
 };

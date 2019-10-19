@@ -1,36 +1,39 @@
 //! Contains infrastructure for configuring the compiler, including parsing
-//! command line options.
+//! command-line options.
 
-use std::str::FromStr;
-
+use crate::lint;
+use crate::middle::cstore;
 use crate::session::{early_error, early_warn, Session};
 use crate::session::search_paths::SearchPath;
 
+use rustc_data_structures::fx::FxHashSet;
+use rustc_data_structures::sync::Lrc;
+
 use rustc_target::spec::{LinkerFlavor, MergeFunctions, PanicStrategy, RelroLevel};
 use rustc_target::spec::{Target, TargetTriple};
-use crate::lint;
-use crate::middle::cstore;
 
 use syntax;
 use syntax::ast::{self, IntTy, UintTy, MetaItemKind};
 use syntax::source_map::{FileName, FilePathMapping};
 use syntax::edition::{Edition, EDITION_NAME_LIST, DEFAULT_EDITION};
+use syntax::parse::new_parser_from_source_str;
 use syntax::parse::token;
-use syntax::parse;
+use syntax::sess::ParseSess;
 use syntax::symbol::{sym, Symbol};
 use syntax::feature_gate::UnstableFeatures;
-use errors::emitter::HumanReadableErrorType;
+use syntax::source_map::SourceMap;
 
-use errors::{ColorConfig, FatalError, Handler};
+use errors::emitter::HumanReadableErrorType;
+use errors::{ColorConfig, FatalError, Handler, SourceMapperDyn};
 
 use getopts;
-use std::collections::{BTreeMap, BTreeSet};
-use std::collections::btree_map::Iter as BTreeMapIter;
-use std::collections::btree_map::Keys as BTreeMapKeysIter;
-use std::collections::btree_map::Values as BTreeMapValuesIter;
 
-use rustc_data_structures::fx::FxHashSet;
-use std::{fmt, str};
+use std::collections::{BTreeMap, BTreeSet};
+use std::collections::btree_map::{
+    Iter as BTreeMapIter, Keys as BTreeMapKeysIter, Values as BTreeMapValuesIter,
+};
+use std::fmt;
+use std::str::{self, FromStr};
 use std::hash::Hasher;
 use std::collections::hash_map::DefaultHasher;
 use std::iter::FromIterator;
@@ -241,14 +244,14 @@ pub enum ErrorOutputType {
 }
 
 impl Default for ErrorOutputType {
-    fn default() -> ErrorOutputType {
-        ErrorOutputType::HumanReadable(HumanReadableErrorType::Default(ColorConfig::Auto))
+    fn default() -> Self {
+        Self::HumanReadable(HumanReadableErrorType::Default(ColorConfig::Auto))
     }
 }
 
-// Use tree-based collections to cheaply get a deterministic Hash implementation.
-// DO NOT switch BTreeMap out for an unsorted container type! That would break
-// dependency tracking for command-line arguments.
+/// Use tree-based collections to cheaply get a deterministic `Hash` implementation.
+/// *Do not* switch `BTreeMap` out for an unsorted container type! That would break
+/// dependency tracking for command-line arguments.
 #[derive(Clone, Hash)]
 pub struct OutputTypes(BTreeMap<OutputType, Option<PathBuf>>);
 
@@ -281,7 +284,7 @@ impl OutputTypes {
         self.0.len()
     }
 
-    // True if any of the output types require codegen or linking.
+    // Returns `true` if any of the output types require codegen or linking.
     pub fn should_codegen(&self) -> bool {
         self.0.keys().any(|k| match *k {
             OutputType::Bitcode
@@ -295,9 +298,9 @@ impl OutputTypes {
     }
 }
 
-// Use tree-based collections to cheaply get a deterministic Hash implementation.
-// DO NOT switch BTreeMap or BTreeSet out for an unsorted container type! That
-// would break dependency tracking for command-line arguments.
+/// Use tree-based collections to cheaply get a deterministic `Hash` implementation.
+/// *Do not* switch `BTreeMap` or `BTreeSet` out for an unsorted container type! That
+/// would break dependency tracking for command-line arguments.
 #[derive(Clone, Hash)]
 pub struct Externs(BTreeMap<String, ExternEntry>);
 
@@ -327,7 +330,7 @@ macro_rules! hash_option {
     ($opt_name:ident, $opt_expr:expr, $sub_hashes:expr, [TRACKED]) => ({
         if $sub_hashes.insert(stringify!($opt_name),
                               $opt_expr as &dyn dep_tracking::DepTrackingHash).is_some() {
-            bug!("Duplicate key in CLI DepTrackingHash: {}", stringify!($opt_name))
+            bug!("duplicate key in CLI DepTrackingHash: {}", stringify!($opt_name))
         }
     });
 }
@@ -362,7 +365,7 @@ macro_rules! top_level_options {
     );
 }
 
-// The top-level command-line options struct
+// The top-level command-line options struct.
 //
 // For each option, one has to specify how it behaves with regard to the
 // dependency tracking system of incremental compilation. This is done via the
@@ -376,16 +379,16 @@ macro_rules! top_level_options {
 // Incremental compilation is not influenced by this option.
 //
 // If you add a new option to this struct or one of the sub-structs like
-// CodegenOptions, think about how it influences incremental compilation. If in
+// `CodegenOptions`, think about how it influences incremental compilation. If in
 // doubt, specify [TRACKED], which is always "correct" but might lead to
 // unnecessary re-compilation.
 top_level_options!(
     pub struct Options {
         // The crate config requested for the session, which may be combined
-        // with additional crate configurations during the compile process
+        // with additional crate configurations during the compile process.
         crate_types: Vec<CrateType> [TRACKED],
         optimize: OptLevel [TRACKED],
-        // Include the debug_assertions flag into dependency tracking, since it
+        // Include the `debug_assertions` flag in dependency tracking, since it
         // can influence whether overflow checks are done or not.
         debug_assertions: bool [TRACKED],
         debuginfo: DebugInfo [TRACKED],
@@ -402,8 +405,8 @@ top_level_options!(
         test: bool [TRACKED],
         error_format: ErrorOutputType [UNTRACKED],
 
-        // if Some, enable incremental compilation, using the given
-        // directory to store intermediate results
+        // If `Some`, enable incremental compilation, using the given
+        // directory to store intermediate results.
         incremental: Option<PathBuf> [UNTRACKED],
 
         debugging_opts: DebuggingOptions [TRACKED],
@@ -418,7 +421,7 @@ top_level_options!(
         // written `extern crate name as std`. Defaults to `std`. Used by
         // out-of-tree drivers.
         alt_std_name: Option<String> [TRACKED],
-        // Indicates how the compiler should treat unstable features
+        // Indicates how the compiler should treat unstable features.
         unstable_features: UnstableFeatures [TRACKED],
 
         // Indicates whether this run of the compiler is actually rustdoc. This
@@ -434,12 +437,12 @@ top_level_options!(
         cli_forced_codegen_units: Option<usize> [UNTRACKED],
         cli_forced_thinlto_off: bool [UNTRACKED],
 
-        // Remap source path prefixes in all output (messages, object files, debug, etc)
+        // Remap source path prefixes in all output (messages, object files, debug, etc.).
         remap_path_prefix: Vec<(PathBuf, PathBuf)> [UNTRACKED],
 
         edition: Edition [TRACKED],
 
-        // Whether or not we're emitting JSON blobs about each artifact produced
+        // `true` if we're emitting JSON blobs about each artifact produced
         // by the compiler.
         json_artifact_notifications: bool [TRACKED],
     }
@@ -468,7 +471,7 @@ pub enum BorrowckMode {
 }
 
 impl BorrowckMode {
-    /// Should we run the MIR-based borrow check, but also fall back
+    /// Returns whether we should run the MIR-based borrow check, but also fall back
     /// on the AST borrow check if the MIR-based one errors.
     pub fn migrate(self) -> bool {
         match self {
@@ -476,23 +479,16 @@ impl BorrowckMode {
             BorrowckMode::Migrate => true,
         }
     }
-
-    /// Should we emit the AST-based borrow checker errors?
-    pub fn use_ast(self) -> bool {
-        match self {
-            BorrowckMode::Mir => false,
-            BorrowckMode::Migrate => false,
-        }
-    }
 }
 
 pub enum Input {
-    /// Loads source from file
+    /// Load source code from a file.
     File(PathBuf),
+    /// Load source code from a string.
     Str {
-        /// String that is shown in place of a filename
+        /// A string that is shown in place of a filename.
         name: FileName,
-        /// Anonymous source string
+        /// An anonymous string containing the source code.
         input: String,
     },
 }
@@ -651,7 +647,7 @@ impl Options {
         FilePathMapping::new(self.remap_path_prefix.clone())
     }
 
-    /// Returns `true` if there will be an output file generated
+    /// Returns `true` if there will be an output file generated.
     pub fn will_create_output_file(&self) -> bool {
         !self.debugging_opts.parse_only && // The file is just being parsed
             !self.debugging_opts.ls // The file is just being queried
@@ -684,7 +680,7 @@ pub enum EntryFnType {
 
 impl_stable_hash_via_hash!(EntryFnType);
 
-#[derive(Copy, PartialEq, PartialOrd, Clone, Ord, Eq, Hash, Debug)]
+#[derive(Copy, PartialEq, PartialOrd, Clone, Ord, Eq, Hash, Debug, HashStable)]
 pub enum CrateType {
     Executable,
     Dylib,
@@ -709,16 +705,14 @@ impl Passes {
     }
 }
 
-/// Declare a macro that will define all CodegenOptions/DebuggingOptions fields and parsers all
-/// at once. The goal of this macro is to define an interface that can be
-/// programmatically used by the option parser in order to initialize the struct
-/// without hardcoding field names all over the place.
+/// Defines all `CodegenOptions`/`DebuggingOptions` fields and parsers all at once. The goal of this
+/// macro is to define an interface that can be programmatically used by the option parser
+/// to initialize the struct without hardcoding field names all over the place.
 ///
-/// The goal is to invoke this macro once with the correct fields, and then this
-/// macro generates all necessary code. The main gotcha of this macro is the
-/// cgsetters module which is a bunch of generated code to parse an option into
-/// its respective field in the struct. There are a few hand-written parsers for
-/// parsing specific types of values in this module.
+/// The goal is to invoke this macro once with the correct fields, and then this macro generates all
+/// necessary code. The main gotcha of this macro is the `cgsetters` module which is a bunch of
+/// generated code to parse an option into its respective field in the struct. There are a few
+/// hand-written parsers for parsing specific types of values in this module.
 macro_rules! options {
     ($struct_name:ident, $setter_name:ident, $defaultfn:ident,
      $buildfn:ident, $prefix:expr, $outputname:expr,
@@ -812,6 +806,7 @@ macro_rules! options {
         pub const parse_list: Option<&str> = Some("a space-separated list of strings");
         pub const parse_opt_list: Option<&str> = Some("a space-separated list of strings");
         pub const parse_opt_comma_list: Option<&str> = Some("a comma-separated list of strings");
+        pub const parse_threads: Option<&str> = Some("a number");
         pub const parse_uint: Option<&str> = Some("a number");
         pub const parse_passes: Option<&str> =
             Some("a space-separated list of passes, or `all`");
@@ -952,6 +947,14 @@ macro_rules! options {
                     true
                 },
                 None => false,
+            }
+        }
+
+        fn parse_threads(slot: &mut usize, v: Option<&str>) -> bool {
+            match v.and_then(|s| s.parse().ok()) {
+                Some(0) => { *slot = ::num_cpus::get(); true },
+                Some(i) => { *slot = i; true },
+                None => false
             }
         }
 
@@ -1258,7 +1261,11 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "prints the LLVM optimization passes being run"),
     ast_json: bool = (false, parse_bool, [UNTRACKED],
         "print the AST as JSON and halt"),
-    threads: Option<usize> = (None, parse_opt_uint, [UNTRACKED],
+    // We default to 1 here since we want to behave like
+    // a sequential compiler for now. This'll likely be adjusted
+    // in the future. Note that -Zthreads=0 is the way to get
+    // the num_cpus behavior.
+    threads: usize = (1, parse_threads, [UNTRACKED],
         "use a thread pool with N threads"),
     ast_json_noexpand: bool = (false, parse_bool, [UNTRACKED],
         "print the pre-expansion AST as JSON and halt"),
@@ -1267,14 +1274,6 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
     save_analysis: bool = (false, parse_bool, [UNTRACKED],
         "write syntax and type analysis (in JSON format) information, in \
          addition to normal output"),
-    flowgraph_print_loans: bool = (false, parse_bool, [UNTRACKED],
-        "include loan analysis data in -Z unpretty flowgraph output"),
-    flowgraph_print_moves: bool = (false, parse_bool, [UNTRACKED],
-        "include move analysis data in -Z unpretty flowgraph output"),
-    flowgraph_print_assigns: bool = (false, parse_bool, [UNTRACKED],
-        "include assignment analysis data in -Z unpretty flowgraph output"),
-    flowgraph_print_all: bool = (false, parse_bool, [UNTRACKED],
-        "include all dataflow analysis data in -Z unpretty flowgraph output"),
     print_region_graph: bool = (false, parse_bool, [UNTRACKED],
         "prints region inference graph. \
          Use with RUST_REGION_GRAPH=help for more info"),
@@ -1292,6 +1291,10 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "show macro backtraces even for non-local macros"),
     teach: bool = (false, parse_bool, [TRACKED],
         "show extended diagnostic help"),
+    terminal_width: Option<usize> = (None, parse_opt_uint, [UNTRACKED],
+        "set the current terminal width"),
+    panic_abort_tests: bool = (false, parse_bool, [TRACKED],
+        "support compiling tests with panic=abort"),
     continue_parse_after_error: bool = (false, parse_bool, [TRACKED],
         "attempt to recover from parse errors (experimental)"),
     dep_tasks: bool = (false, parse_bool, [UNTRACKED],
@@ -1314,10 +1317,6 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "dump the dependency graph to $RUST_DEP_GRAPH (default: /tmp/dep_graph.gv)"),
     query_dep_graph: bool = (false, parse_bool, [UNTRACKED],
         "enable queries of the dependency graph for regression testing"),
-    profile_queries: bool = (false, parse_bool, [UNTRACKED],
-        "trace and profile the queries of the incremental compilation framework"),
-    profile_queries_and_keys: bool = (false, parse_bool, [UNTRACKED],
-        "trace and profile the queries and keys of the incremental compilation framework"),
     no_analysis: bool = (false, parse_bool, [UNTRACKED],
         "parse and expand the source, but run no analysis"),
     extra_plugins: Vec<String> = (Vec::new(), parse_list, [TRACKED],
@@ -1343,7 +1342,7 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
     mir_opt_level: usize = (1, parse_uint, [TRACKED],
         "set the MIR optimization level (0-3, default: 1)"),
     mutable_noalias: Option<bool> = (None, parse_opt_bool, [TRACKED],
-        "emit noalias metadata for mutable references (default: yes on LLVM >= 6)"),
+        "emit noalias metadata for mutable references (default: no)"),
     dump_mir: Option<String> = (None, parse_opt_string, [UNTRACKED],
         "dump MIR state to file.
         `val` is used to select which passes and functions to dump. For example:
@@ -1372,6 +1371,8 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "describes how to render the `rendered` field of json diagnostics"),
     unleash_the_miri_inside_of_you: bool = (false, parse_bool, [TRACKED],
         "take the breaks off const evaluation. NOTE: this is unsound"),
+    suppress_const_validation_back_compat_ice: bool = (false, parse_bool, [TRACKED],
+        "silence ICE triggered when the new const validator disagrees with the old"),
     osx_rpath_install_name: bool = (false, parse_bool, [TRACKED],
         "pass `-install_name @rpath/...` to the macOS linker"),
     sanitizer: Option<Sanitizer> = (None, parse_sanitizer, [TRACKED],
@@ -1421,8 +1422,6 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         valid types are any of the types for `--pretty`, as well as:
         `expanded`, `expanded,identified`,
         `expanded,hygiene` (with internal representations),
-        `flowgraph=<nodeid>` (graphviz formatted flowgraph for node),
-        `flowgraph,unlabelled=<nodeid>` (unlabelled graphviz formatted flowgraph for node),
         `everybody_loops` (all function bodies replaced with `loop {}`),
         `hir` (the HIR), `hir,identified`,
         `hir,typed` (HIR with types for each node),
@@ -1469,6 +1468,9 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "which mangling version to use for symbol names"),
     binary_dep_depinfo: bool = (false, parse_bool, [TRACKED],
         "include artifacts (sysroot, crate dependencies) used during compilation in dep-info"),
+    insert_sideeffect: bool = (false, parse_bool, [TRACKED],
+        "fix undefined behavior when a thread doesn't eventually make progress \
+         (such as entering an empty infinite loop) by inserting llvm.sideeffect"),
 }
 
 pub fn default_lib_output() -> CrateType {
@@ -1512,21 +1514,24 @@ pub fn default_configuration(sess: &Session) -> ast::CrateConfig {
     }
     for &i in &[8, 16, 32, 64, 128] {
         if i >= min_atomic_width && i <= max_atomic_width {
-            let s = i.to_string();
-            ret.insert((
-                sym::target_has_atomic,
-                Some(Symbol::intern(&s)),
-            ));
-            if &s == wordsz {
+            let mut insert_atomic = |s| {
                 ret.insert((
-                    sym::target_has_atomic,
-                    Some(Symbol::intern("ptr")),
+                    sym::target_has_atomic_load_store,
+                    Some(Symbol::intern(s)),
                 ));
+                if atomic_cas {
+                    ret.insert((
+                        sym::target_has_atomic,
+                        Some(Symbol::intern(s))
+                    ));
+                }
+            };
+            let s = i.to_string();
+            insert_atomic(&s);
+            if &s == wordsz {
+              insert_atomic("ptr");
             }
         }
-    }
-    if atomic_cas {
-        ret.insert((sym::target_has_atomic, Some(Symbol::intern("cas"))));
     }
     if sess.opts.debug_assertions {
         ret.insert((Symbol::intern("debug_assertions"), None));
@@ -1537,7 +1542,7 @@ pub fn default_configuration(sess: &Session) -> ast::CrateConfig {
     ret
 }
 
-/// Converts the crate cfg! configuration from String to Symbol.
+/// Converts the crate `cfg!` configuration from `String` to `Symbol`.
 /// `rustc_interface::interface::Config` accepts this in the compiler configuration,
 /// but the symbol interner is not yet set up then, so we must convert it later.
 pub fn to_crate_config(cfg: FxHashSet<(String, Option<String>)>) -> ast::CrateConfig {
@@ -1548,9 +1553,9 @@ pub fn to_crate_config(cfg: FxHashSet<(String, Option<String>)>) -> ast::CrateCo
 
 pub fn build_configuration(sess: &Session, mut user_cfg: ast::CrateConfig) -> ast::CrateConfig {
     // Combine the configuration requested by the session (command line) with
-    // some default and generated configuration items
+    // some default and generated configuration items.
     let default_cfg = default_configuration(sess);
-    // If the user wants a test runner, then add the test cfg
+    // If the user wants a test runner, then add the test cfg.
     if sess.opts.test {
         user_cfg.insert((sym::test, None));
     }
@@ -1719,13 +1724,7 @@ pub fn rustc_short_optgroups() -> Vec<RustcOptGroup> {
                              static, framework, or dylib (the default).",
             "[KIND=]NAME",
         ),
-        opt::multi_s(
-            "",
-            "crate-type",
-            "Comma separated list of types of crates
-                                    for the compiler to emit",
-            "[bin|lib|rlib|dylib|cdylib|staticlib|proc-macro]",
-        ),
+        make_crate_type_option(),
         opt::opt_s(
             "",
             "crate-name",
@@ -1855,13 +1854,23 @@ pub fn rustc_optgroups() -> Vec<RustcOptGroup> {
     opts
 }
 
-// Convert strings provided as --cfg [cfgspec] into a crate_cfg
+struct NullEmitter;
+
+impl errors::emitter::Emitter for NullEmitter {
+    fn emit_diagnostic(&mut self, _: &errors::Diagnostic) {}
+    fn source_map(&self) -> Option<&Lrc<SourceMapperDyn>> { None }
+}
+
+// Converts strings provided as `--cfg [cfgspec]` into a `crate_cfg`.
 pub fn parse_cfgspecs(cfgspecs: Vec<String>) -> FxHashSet<(String, Option<String>)> {
     syntax::with_default_globals(move || {
         let cfg = cfgspecs.into_iter().map(|s| {
-            let sess = parse::ParseSess::new(FilePathMapping::empty());
+
+            let cm = Lrc::new(SourceMap::new(FilePathMapping::empty()));
+            let handler = Handler::with_emitter(false, None, Box::new(NullEmitter));
+            let sess = ParseSess::with_span_handler(handler, cm);
             let filename = FileName::cfg_spec_source_code(&s);
-            let mut parser = parse::new_parser_from_source_str(&sess, filename, s.to_string());
+            let mut parser = new_parser_from_source_str(&sess, filename, s.to_string());
 
             macro_rules! error {($reason: expr) => {
                 early_error(ErrorOutputType::default(),
@@ -1873,11 +1882,11 @@ pub fn parse_cfgspecs(cfgspecs: Vec<String>) -> FxHashSet<(String, Option<String
                     if meta_item.path.segments.len() != 1 {
                         error!("argument key must be an identifier");
                     }
-                    match &meta_item.node {
+                    match &meta_item.kind {
                         MetaItemKind::List(..) => {
                             error!(r#"expected `key` or `key="value"`"#);
                         }
-                        MetaItemKind::NameValue(lit) if !lit.node.is_str() => {
+                        MetaItemKind::NameValue(lit) if !lit.kind.is_str() => {
                             error!("argument value must be a string");
                         }
                         MetaItemKind::NameValue(..) | MetaItemKind::Word => {
@@ -1921,7 +1930,7 @@ pub fn get_cmd_lint_options(matches: &getopts::Matches,
     (lint_opts, describe_lints, lint_cap)
 }
 
-/// Parse the `--color` flag
+/// Parses the `--color` flag.
 pub fn parse_color(matches: &getopts::Matches) -> ColorConfig {
     match matches.opt_str("color").as_ref().map(|s| &s[..]) {
         Some("auto") => ColorConfig::Auto,
@@ -1933,7 +1942,7 @@ pub fn parse_color(matches: &getopts::Matches) -> ColorConfig {
         Some(arg) => early_error(
             ErrorOutputType::default(),
             &format!(
-                "argument for --color must be auto, \
+                "argument for `--color` must be auto, \
                  always or never (instead was `{}`)",
                 arg
             ),
@@ -1978,16 +1987,16 @@ pub fn parse_json(matches: &getopts::Matches) -> (HumanReadableErrorType, bool) 
     (json_rendered(json_color), json_artifact_notifications)
 }
 
-/// Parse the `--error-format` flag
+/// Parses the `--error-format` flag.
 pub fn parse_error_format(
     matches: &getopts::Matches,
     color: ColorConfig,
     json_rendered: HumanReadableErrorType,
 ) -> ErrorOutputType {
-    // We need the opts_present check because the driver will send us Matches
+    // We need the `opts_present` check because the driver will send us Matches
     // with only stable options if no unstable options are used. Since error-format
-    // is unstable, it will not be present. We have to use opts_present not
-    // opt_present because the latter will panic.
+    // is unstable, it will not be present. We have to use `opts_present` not
+    // `opt_present` because the latter will panic.
     let error_format = if matches.opts_present(&["error-format".to_owned()]) {
         match matches.opt_str("error-format").as_ref().map(|s| &s[..]) {
             None |
@@ -2002,7 +2011,7 @@ pub fn parse_error_format(
             Some(arg) => early_error(
                 ErrorOutputType::HumanReadable(HumanReadableErrorType::Default(color)),
                 &format!(
-                    "argument for --error-format must be `human`, `json` or \
+                    "argument for `--error-format` must be `human`, `json` or \
                      `short` (instead was `{}`)",
                     arg
                 ),
@@ -2031,17 +2040,13 @@ pub fn parse_error_format(
     return error_format;
 }
 
-pub fn build_session_options_and_crate_config(
-    matches: &getopts::Matches,
-) -> (Options, FxHashSet<(String, Option<String>)>) {
-    let color = parse_color(matches);
-
+fn parse_crate_edition(matches: &getopts::Matches) -> Edition {
     let edition = match matches.opt_str("edition") {
         Some(arg) => Edition::from_str(&arg).unwrap_or_else(|_|
             early_error(
                 ErrorOutputType::default(),
                 &format!(
-                    "argument for --edition must be one of: \
+                    "argument for `--edition` must be one of: \
                      {}. (instead was `{}`)",
                     EDITION_NAME_LIST,
                     arg
@@ -2055,42 +2060,43 @@ pub fn build_session_options_and_crate_config(
         early_error(
                 ErrorOutputType::default(),
                 &format!(
-                    "Edition {} is unstable and only \
+                    "edition {} is unstable and only \
                      available for nightly builds of rustc.",
                     edition,
                 )
         )
     }
 
-    let (json_rendered, json_artifact_notifications) = parse_json(matches);
+    edition
+}
 
-    let error_format = parse_error_format(matches, color, json_rendered);
-
-    let unparsed_crate_types = matches.opt_strs("crate-type");
-    let crate_types = parse_crate_types_from_list(unparsed_crate_types)
-        .unwrap_or_else(|e| early_error(error_format, &e[..]));
-
-
-    let (lint_opts, describe_lints, lint_cap) = get_cmd_lint_options(matches, error_format);
-
-    let mut debugging_opts = build_debugging_options(matches, error_format);
-
+fn check_debug_option_stability(
+    debugging_opts: &DebuggingOptions,
+    error_format: ErrorOutputType,
+    json_rendered: HumanReadableErrorType,
+) {
     if !debugging_opts.unstable_options {
         if let ErrorOutputType::Json { pretty: true, json_rendered } = error_format {
             early_error(
                 ErrorOutputType::Json { pretty: false, json_rendered },
-                "--error-format=pretty-json is unstable",
+                "`--error-format=pretty-json` is unstable",
             );
         }
         if let ErrorOutputType::HumanReadable(HumanReadableErrorType::AnnotateSnippet(_)) =
             error_format {
             early_error(
                 ErrorOutputType::Json { pretty: false, json_rendered },
-                "--error-format=human-annotate-rs is unstable",
+                "`--error-format=human-annotate-rs` is unstable",
             );
         }
     }
+}
 
+fn parse_output_types(
+    debugging_opts: &DebuggingOptions,
+    matches: &getopts::Matches,
+    error_format: ErrorOutputType,
+) -> OutputTypes {
     let mut output_types = BTreeMap::new();
     if !debugging_opts.parse_only {
         for list in matches.opt_strs("emit") {
@@ -2115,14 +2121,19 @@ pub fn build_session_options_and_crate_config(
     if output_types.is_empty() {
         output_types.insert(OutputType::Exe, None);
     }
+    OutputTypes(output_types)
+}
 
-    let mut cg = build_codegen_options(matches, error_format);
-    let mut codegen_units = cg.codegen_units;
+fn should_override_cgus_and_disable_thinlto(
+    output_types: &OutputTypes,
+    matches: &getopts::Matches,
+    error_format: ErrorOutputType,
+    mut codegen_units: Option<usize>,
+) -> (bool, Option<usize>) {
     let mut disable_thinlto = false;
-
-    // Issue #30063: if user requests llvm-related output to one
+    // Issue #30063: if user requests LLVM-related output to one
     // particular path, disable codegen-units.
-    let incompatible: Vec<_> = output_types
+    let incompatible: Vec<_> = output_types.0
         .iter()
         .map(|ot_path| ot_path.0)
         .filter(|ot| !ot.is_compatible_with_codegen_units_and_single_output_file())
@@ -2136,8 +2147,8 @@ pub fn build_session_options_and_crate_config(
                         early_warn(
                             error_format,
                             &format!(
-                                "--emit={} with -o incompatible with \
-                                 -C codegen-units=N for N > 1",
+                                "`--emit={}` with `-o` incompatible with \
+                                 `-C codegen-units=N` for N > 1",
                                 ot
                             ),
                         );
@@ -2154,29 +2165,39 @@ pub fn build_session_options_and_crate_config(
         }
     }
 
-    if debugging_opts.threads == Some(0) {
-        early_error(
-            error_format,
-            "Value for threads must be a positive nonzero integer",
-        );
-    }
-
-    if debugging_opts.threads.unwrap_or(1) > 1 && debugging_opts.fuel.is_some() {
-        early_error(
-            error_format,
-            "Optimization fuel is incompatible with multiple threads",
-        );
-    }
-
     if codegen_units == Some(0) {
         early_error(
             error_format,
-            "Value for codegen units must be a positive nonzero integer",
+            "value for codegen units must be a positive non-zero integer",
         );
     }
 
-    let incremental = match (&debugging_opts.incremental, &cg.incremental) {
-        (&Some(ref path1), &Some(ref path2)) => {
+    (disable_thinlto, codegen_units)
+}
+
+fn check_thread_count(debugging_opts: &DebuggingOptions, error_format: ErrorOutputType) {
+    if debugging_opts.threads == 0 {
+        early_error(
+            error_format,
+            "value for threads must be a positive non-zero integer",
+        );
+    }
+
+    if debugging_opts.threads > 1 && debugging_opts.fuel.is_some() {
+        early_error(
+            error_format,
+            "optimization fuel is incompatible with multiple threads",
+        );
+    }
+}
+
+fn select_incremental_path(
+    debugging_opts: &DebuggingOptions,
+    cg: &CodegenOptions,
+    error_format: ErrorOutputType,
+) -> Option<PathBuf> {
+    match (&debugging_opts.incremental, &cg.incremental) {
+        (Some(path1), Some(path2)) => {
             if path1 != path2 {
                 early_error(
                     error_format,
@@ -2190,25 +2211,19 @@ pub fn build_session_options_and_crate_config(
                 Some(path1)
             }
         }
-        (&Some(ref path), &None) => Some(path),
-        (&None, &Some(ref path)) => Some(path),
-        (&None, &None) => None,
-    }.map(|m| PathBuf::from(m));
+        (Some(path), None) => Some(path),
+        (None, Some(path)) => Some(path),
+        (None, None) => None,
+    }.map(|m| PathBuf::from(m))
+}
 
-    if debugging_opts.profile && incremental.is_some() {
-        early_error(
-            error_format,
-            "can't instrument with gcov profiling when compiling incrementally",
-        );
-    }
-
-    if cg.profile_generate.enabled() && cg.profile_use.is_some() {
-        early_error(
-            error_format,
-            "options `-C profile-generate` and `-C profile-use` are exclusive",
-        );
-    }
-
+fn collect_print_requests(
+    cg: &mut CodegenOptions,
+    dopts: &mut DebuggingOptions,
+    matches: &getopts::Matches,
+    is_unstable_enabled: bool,
+    error_format: ErrorOutputType,
+) -> Vec<PrintRequest> {
     let mut prints = Vec::<PrintRequest>::new();
     if cg.target_cpu.as_ref().map_or(false, |s| s == "help") {
         prints.push(PrintRequest::TargetCPUs);
@@ -2226,72 +2241,105 @@ pub fn build_session_options_and_crate_config(
         prints.push(PrintRequest::CodeModels);
         cg.code_model = None;
     }
-    if debugging_opts
+    if dopts
         .tls_model
         .as_ref()
         .map_or(false, |s| s == "help")
     {
         prints.push(PrintRequest::TlsModels);
-        debugging_opts.tls_model = None;
+        dopts.tls_model = None;
     }
 
-    let cg = cg;
+    prints.extend(matches.opt_strs("print").into_iter().map(|s| match &*s {
+        "crate-name" => PrintRequest::CrateName,
+        "file-names" => PrintRequest::FileNames,
+        "sysroot" => PrintRequest::Sysroot,
+        "cfg" => PrintRequest::Cfg,
+        "target-list" => PrintRequest::TargetList,
+        "target-cpus" => PrintRequest::TargetCPUs,
+        "target-features" => PrintRequest::TargetFeatures,
+        "relocation-models" => PrintRequest::RelocationModels,
+        "code-models" => PrintRequest::CodeModels,
+        "tls-models" => PrintRequest::TlsModels,
+        "native-static-libs" => PrintRequest::NativeStaticLibs,
+        "target-spec-json" => {
+            if is_unstable_enabled {
+                PrintRequest::TargetSpec
+            } else {
+                early_error(
+                    error_format,
+                    "the `-Z unstable-options` flag must also be passed to \
+                     enable the target-spec-json print option",
+                );
+            }
+        }
+        req => early_error(error_format, &format!("unknown print request `{}`", req)),
+    }));
 
-    let sysroot_opt = matches.opt_str("sysroot").map(|m| PathBuf::from(&m));
-    let target_triple = if let Some(target) = matches.opt_str("target") {
-        if target.ends_with(".json") {
+    prints
+}
+
+fn parse_target_triple(matches: &getopts::Matches, error_format: ErrorOutputType) -> TargetTriple {
+    match matches.opt_str("target") {
+        Some(target) if target.ends_with(".json") => {
             let path = Path::new(&target);
             TargetTriple::from_path(&path).unwrap_or_else(|_|
                 early_error(error_format, &format!("target file {:?} does not exist", path)))
-        } else {
-            TargetTriple::TargetTriple(target)
         }
+        Some(target) => TargetTriple::TargetTriple(target),
+        _ => TargetTriple::from_triple(host_triple()),
+    }
+}
+
+fn parse_opt_level(
+    matches: &getopts::Matches,
+    cg: &CodegenOptions,
+    error_format: ErrorOutputType,
+) -> OptLevel {
+    // The `-O` and `-C opt-level` flags specify the same setting, so we want to be able
+    // to use them interchangeably. However, because they're technically different flags,
+    // we need to work out manually which should take precedence if both are supplied (i.e.
+    // the rightmost flag). We do this by finding the (rightmost) position of both flags and
+    // comparing them. Note that if a flag is not found, its position will be `None`, which
+    // always compared less than `Some(_)`.
+    let max_o = matches.opt_positions("O").into_iter().max();
+    let max_c = matches.opt_strs_pos("C").into_iter().flat_map(|(i, s)| {
+        if let Some("opt-level") = s.splitn(2, '=').next() {
+            Some(i)
+        } else {
+            None
+        }
+    }).max();
+    if max_o > max_c {
+        OptLevel::Default
     } else {
-        TargetTriple::from_triple(host_triple())
-    };
-    let opt_level = {
-        // The `-O` and `-C opt-level` flags specify the same setting, so we want to be able
-        // to use them interchangeably. However, because they're technically different flags,
-        // we need to work out manually which should take precedence if both are supplied (i.e.
-        // the rightmost flag). We do this by finding the (rightmost) position of both flags and
-        // comparing them. Note that if a flag is not found, its position will be `None`, which
-        // always compared less than `Some(_)`.
-        let max_o = matches.opt_positions("O").into_iter().max();
-        let max_c = matches.opt_strs_pos("C").into_iter().flat_map(|(i, s)| {
-            if let Some("opt-level") = s.splitn(2, '=').next() {
-                Some(i)
-            } else {
-                None
-            }
-        }).max();
-        if max_o > max_c {
-            OptLevel::Default
-        } else {
-            match cg.opt_level.as_ref().map(String::as_ref) {
-                None => OptLevel::No,
-                Some("0") => OptLevel::No,
-                Some("1") => OptLevel::Less,
-                Some("2") => OptLevel::Default,
-                Some("3") => OptLevel::Aggressive,
-                Some("s") => OptLevel::Size,
-                Some("z") => OptLevel::SizeMin,
-                Some(arg) => {
-                    early_error(
-                        error_format,
-                        &format!(
-                            "optimization level needs to be \
-                             between 0-3, s or z (instead was `{}`)",
-                            arg
-                        ),
-                    );
-                }
+        match cg.opt_level.as_ref().map(String::as_ref) {
+            None => OptLevel::No,
+            Some("0") => OptLevel::No,
+            Some("1") => OptLevel::Less,
+            Some("2") => OptLevel::Default,
+            Some("3") => OptLevel::Aggressive,
+            Some("s") => OptLevel::Size,
+            Some("z") => OptLevel::SizeMin,
+            Some(arg) => {
+                early_error(
+                    error_format,
+                    &format!(
+                        "optimization level needs to be \
+                            between 0-3, s or z (instead was `{}`)",
+                        arg
+                    ),
+                );
             }
         }
-    };
-    // The `-g` and `-C debuginfo` flags specify the same setting, so we want to be able
-    // to use them interchangeably. See the note above (regarding `-O` and `-C opt-level`)
-    // for more details.
-    let debug_assertions = cg.debug_assertions.unwrap_or(opt_level == OptLevel::No);
+    }
+}
+
+fn select_debuginfo(
+    matches: &getopts::Matches,
+    cg: &CodegenOptions,
+    error_format: ErrorOutputType,
+) -> DebugInfo {
     let max_g = matches.opt_positions("g").into_iter().max();
     let max_c = matches.opt_strs_pos("C").into_iter().flat_map(|(i, s)| {
         if let Some("debuginfo") = s.splitn(2, '=').next() {
@@ -2300,7 +2348,7 @@ pub fn build_session_options_and_crate_config(
             None
         }
     }).max();
-    let debuginfo = if max_g > max_c {
+    if max_g > max_c {
         DebugInfo::Full
     } else {
         match cg.debuginfo {
@@ -2318,14 +2366,14 @@ pub fn build_session_options_and_crate_config(
                 );
             }
         }
-    };
-
-    let mut search_paths = vec![];
-    for s in &matches.opt_strs("L") {
-        search_paths.push(SearchPath::from_cli_opt(&s[..], error_format));
     }
+}
 
-    let libs = matches
+fn parse_libs(
+    matches: &getopts::Matches,
+    error_format: ErrorOutputType,
+) -> Vec<(String, Option<String>, Option<cstore::NativeLibraryKind>)> {
+    matches
         .opt_strs("l")
         .into_iter()
         .map(|s| {
@@ -2364,52 +2412,23 @@ pub fn build_session_options_and_crate_config(
             let new_name = name_parts.next();
             (name.to_owned(), new_name.map(|n| n.to_owned()), kind)
         })
-        .collect();
+        .collect()
+}
 
-    let cfg = parse_cfgspecs(matches.opt_strs("cfg"));
-    let test = matches.opt_present("test");
-
-    let is_unstable_enabled = nightly_options::is_unstable_enabled(matches);
-
-    prints.extend(matches.opt_strs("print").into_iter().map(|s| match &*s {
-        "crate-name" => PrintRequest::CrateName,
-        "file-names" => PrintRequest::FileNames,
-        "sysroot" => PrintRequest::Sysroot,
-        "cfg" => PrintRequest::Cfg,
-        "target-list" => PrintRequest::TargetList,
-        "target-cpus" => PrintRequest::TargetCPUs,
-        "target-features" => PrintRequest::TargetFeatures,
-        "relocation-models" => PrintRequest::RelocationModels,
-        "code-models" => PrintRequest::CodeModels,
-        "tls-models" => PrintRequest::TlsModels,
-        "native-static-libs" => PrintRequest::NativeStaticLibs,
-        "target-spec-json" => {
-            if is_unstable_enabled {
-                PrintRequest::TargetSpec
-            } else {
-                early_error(
-                    error_format,
-                    "the `-Z unstable-options` flag must also be passed to \
-                     enable the target-spec-json print option",
-                );
-            }
-        }
-        req => early_error(error_format, &format!("unknown print request `{}`", req)),
-    }));
-
-    let borrowck_mode = match debugging_opts.borrowck.as_ref().map(|s| &s[..]) {
+fn parse_borrowck_mode(dopts: &DebuggingOptions, error_format: ErrorOutputType) -> BorrowckMode {
+    match dopts.borrowck.as_ref().map(|s| &s[..]) {
         None | Some("migrate") => BorrowckMode::Migrate,
         Some("mir") => BorrowckMode::Mir,
         Some(m) => early_error(error_format, &format!("unknown borrowck mode `{}`", m)),
-    };
-
-    if !cg.remark.is_empty() && debuginfo == DebugInfo::None {
-        early_warn(
-            error_format,
-            "-C remark requires \"-C debuginfo=n\" to show source locations",
-        );
     }
+}
 
+fn parse_externs(
+    matches: &getopts::Matches,
+    debugging_opts: &DebuggingOptions,
+    error_format: ErrorOutputType,
+    is_unstable_enabled: bool,
+) -> Externs {
     if matches.opt_present("extern-private") && !debugging_opts.unstable_options {
         early_error(
             ErrorOutputType::default(),
@@ -2418,10 +2437,10 @@ pub fn build_session_options_and_crate_config(
         )
     }
 
-    // We start out with a Vec<(Option<String>, bool)>>,
-    // and later convert it into a BTreeSet<(Option<String>, bool)>
+    // We start out with a `Vec<(Option<String>, bool)>>`,
+    // and later convert it into a `BTreeSet<(Option<String>, bool)>`
     // This allows to modify entries in-place to set their correct
-    // 'public' value
+    // 'public' value.
     let mut externs: BTreeMap<String, ExternEntry> = BTreeMap::new();
     for (arg, private) in matches.opt_strs("extern").into_iter().map(|v| (v, false))
         .chain(matches.opt_strs("extern-private").into_iter().map(|v| (v, true))) {
@@ -2450,10 +2469,14 @@ pub fn build_session_options_and_crate_config(
         // flag
         entry.is_private_dep |= private;
     }
+    Externs(externs)
+}
 
-    let crate_name = matches.opt_str("crate-name");
-
-    let remap_path_prefix = matches
+fn parse_remap_path_prefix(
+    matches: &getopts::Matches,
+    error_format: ErrorOutputType
+) -> Vec<(PathBuf, PathBuf)> {
+    matches
         .opt_strs("remap-path-prefix")
         .into_iter()
         .map(|remap| {
@@ -2468,41 +2491,139 @@ pub fn build_session_options_and_crate_config(
                 ),
             }
         })
-        .collect();
+        .collect()
+}
 
-    (
-        Options {
-            crate_types,
-            optimize: opt_level,
-            debuginfo,
-            lint_opts,
-            lint_cap,
-            describe_lints,
-            output_types: OutputTypes(output_types),
-            search_paths,
-            maybe_sysroot: sysroot_opt,
-            target_triple,
-            test,
-            incremental,
-            debugging_opts,
-            prints,
-            borrowck_mode,
-            cg,
+pub fn build_session_options(matches: &getopts::Matches) -> Options {
+    let color = parse_color(matches);
+
+    let edition = parse_crate_edition(matches);
+
+    let (json_rendered, json_artifact_notifications) = parse_json(matches);
+
+    let error_format = parse_error_format(matches, color, json_rendered);
+
+    let unparsed_crate_types = matches.opt_strs("crate-type");
+    let crate_types = parse_crate_types_from_list(unparsed_crate_types)
+        .unwrap_or_else(|e| early_error(error_format, &e[..]));
+
+    let (lint_opts, describe_lints, lint_cap) = get_cmd_lint_options(matches, error_format);
+
+    let mut debugging_opts = build_debugging_options(matches, error_format);
+    check_debug_option_stability(&debugging_opts, error_format, json_rendered);
+
+    let output_types = parse_output_types(&debugging_opts, matches, error_format);
+
+    let mut cg = build_codegen_options(matches, error_format);
+    let (disable_thinlto, codegen_units) = should_override_cgus_and_disable_thinlto(
+        &output_types,
+        matches,
+        error_format,
+        cg.codegen_units,
+    );
+
+    check_thread_count(&debugging_opts, error_format);
+
+    let incremental = select_incremental_path(&debugging_opts, &cg, error_format);
+
+    if debugging_opts.profile && incremental.is_some() {
+        early_error(
             error_format,
-            externs: Externs(externs),
-            crate_name,
-            alt_std_name: None,
-            libs,
-            unstable_features: UnstableFeatures::from_environment(),
-            debug_assertions,
-            actually_rustdoc: false,
-            cli_forced_codegen_units: codegen_units,
-            cli_forced_thinlto_off: disable_thinlto,
-            remap_path_prefix,
-            edition,
-            json_artifact_notifications,
-        },
-        cfg,
+            "can't instrument with gcov profiling when compiling incrementally",
+        );
+    }
+
+    if cg.profile_generate.enabled() && cg.profile_use.is_some() {
+        early_error(
+            error_format,
+            "options `-C profile-generate` and `-C profile-use` are exclusive",
+        );
+    }
+
+    let is_unstable_enabled = nightly_options::is_unstable_enabled(matches);
+    let prints = collect_print_requests(
+        &mut cg,
+        &mut debugging_opts,
+        matches,
+        is_unstable_enabled,
+        error_format,
+    );
+
+    let cg = cg;
+
+    let sysroot_opt = matches.opt_str("sysroot").map(|m| PathBuf::from(&m));
+    let target_triple = parse_target_triple(matches, error_format);
+    let opt_level = parse_opt_level(matches, &cg, error_format);
+    // The `-g` and `-C debuginfo` flags specify the same setting, so we want to be able
+    // to use them interchangeably. See the note above (regarding `-O` and `-C opt-level`)
+    // for more details.
+    let debug_assertions = cg.debug_assertions.unwrap_or(opt_level == OptLevel::No);
+    let debuginfo = select_debuginfo(matches, &cg, error_format);
+
+    let mut search_paths = vec![];
+    for s in &matches.opt_strs("L") {
+        search_paths.push(SearchPath::from_cli_opt(&s[..], error_format));
+    }
+
+    let libs = parse_libs(matches, error_format);
+
+    let test = matches.opt_present("test");
+
+    let borrowck_mode = parse_borrowck_mode(&debugging_opts, error_format);
+
+    if !cg.remark.is_empty() && debuginfo == DebugInfo::None {
+        early_warn(
+            error_format,
+            "-C remark requires \"-C debuginfo=n\" to show source locations",
+        );
+    }
+
+    let externs = parse_externs(matches, &debugging_opts, error_format, is_unstable_enabled);
+
+    let crate_name = matches.opt_str("crate-name");
+
+    let remap_path_prefix = parse_remap_path_prefix(matches, error_format);
+
+    Options {
+        crate_types,
+        optimize: opt_level,
+        debuginfo,
+        lint_opts,
+        lint_cap,
+        describe_lints,
+        output_types,
+        search_paths,
+        maybe_sysroot: sysroot_opt,
+        target_triple,
+        test,
+        incremental,
+        debugging_opts,
+        prints,
+        borrowck_mode,
+        cg,
+        error_format,
+        externs,
+        crate_name,
+        alt_std_name: None,
+        libs,
+        unstable_features: UnstableFeatures::from_environment(),
+        debug_assertions,
+        actually_rustdoc: false,
+        cli_forced_codegen_units: codegen_units,
+        cli_forced_thinlto_off: disable_thinlto,
+        remap_path_prefix,
+        edition,
+        json_artifact_notifications,
+    }
+}
+
+pub fn make_crate_type_option() -> RustcOptGroup {
+    opt::multi_s(
+        "",
+        "crate-type",
+        "Comma separated list of types of crates
+                                for the compiler to emit",
+        "[bin|lib|rlib|dylib|cdylib|staticlib|proc-macro]",
     )
 }
 
@@ -2610,15 +2731,15 @@ impl fmt::Display for CrateType {
 /// The values of all command-line arguments that are relevant for dependency
 /// tracking are hashed into a single value that determines whether the
 /// incremental compilation cache can be re-used or not. This hashing is done
-/// via the DepTrackingHash trait defined below, since the standard Hash
-/// implementation might not be suitable (e.g., arguments are stored in a Vec,
+/// via the `DepTrackingHash` trait defined below, since the standard `Hash`
+/// implementation might not be suitable (e.g., arguments are stored in a `Vec`,
 /// the hash of which is order dependent, but we might not want the order of
 /// arguments to make a difference for the hash).
 ///
-/// However, since the value provided by Hash::hash often *is* suitable,
+/// However, since the value provided by `Hash::hash` often *is* suitable,
 /// especially for primitive types, there is the
-/// impl_dep_tracking_hash_via_hash!() macro that allows to simply reuse the
-/// Hash implementation for DepTrackingHash. It's important though that
+/// `impl_dep_tracking_hash_via_hash!()` macro that allows to simply reuse the
+/// `Hash` implementation for `DepTrackingHash`. It's important though that
 /// we have an opt-in scheme here, so one is hopefully forced to think about
 /// how the hash should be calculated when adding a new command-line argument.
 mod dep_tracking {
@@ -2631,9 +2752,9 @@ mod dep_tracking {
     use super::{CrateType, DebugInfo, ErrorOutputType, OptLevel, OutputTypes,
                 Passes, Sanitizer, LtoCli, LinkerPluginLto, SwitchWithOptPath,
                 SymbolManglingVersion};
-    use syntax::feature_gate::UnstableFeatures;
     use rustc_target::spec::{MergeFunctions, PanicStrategy, RelroLevel, TargetTriple};
     use syntax::edition::Edition;
+    use syntax::feature_gate::UnstableFeatures;
 
     pub trait DepTrackingHash {
         fn hash(&self, hasher: &mut DefaultHasher, error_format: ErrorOutputType);

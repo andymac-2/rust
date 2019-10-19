@@ -1,9 +1,9 @@
 use crate::ty::{self, TyCtxt};
-use rustc_data_structures::indexed_vec::Idx;
+use rustc_index::vec::Idx;
 use std::fmt;
 use std::u32;
 
-newtype_index! {
+rustc_index::newtype_index! {
     pub struct CrateId {
         ENCODABLE = custom
     }
@@ -11,7 +11,7 @@ newtype_index! {
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CrateNum {
-    /// A special CrateNum that we use for the tcx.rcache when decoding from
+    /// A special `CrateNum` that we use for the `tcx.rcache` when decoding from
     /// the incr. comp. cache.
     ReservedForIncrCompCache,
     Index(CrateId),
@@ -26,10 +26,9 @@ impl ::std::fmt::Debug for CrateNum {
     }
 }
 
-/// Item definitions in the currently-compiled crate would have the CrateNum
-/// LOCAL_CRATE in their DefId.
+/// Item definitions in the currently-compiled crate would have the `CrateNum`
+/// `LOCAL_CRATE` in their `DefId`.
 pub const LOCAL_CRATE: CrateNum = CrateNum::Index(CrateId::from_u32_const(0));
-
 
 impl Idx for CrateNum {
     #[inline]
@@ -88,7 +87,7 @@ impl fmt::Display for CrateNum {
 impl rustc_serialize::UseSpecializedEncodable for CrateNum {}
 impl rustc_serialize::UseSpecializedDecodable for CrateNum {}
 
-newtype_index! {
+rustc_index::newtype_index! {
     /// A DefIndex is an index into the hir-map for a crate, identifying a
     /// particular definition. It should really be considered an interned
     /// shorthand for a particular DefPath.

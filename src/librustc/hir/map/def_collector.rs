@@ -2,7 +2,7 @@ use crate::hir::map::definitions::*;
 use crate::hir::def_id::DefIndex;
 
 use syntax::ast::*;
-use syntax::ext::hygiene::ExpnId;
+use syntax_expand::hygiene::ExpnId;
 use syntax::visit;
 use syntax::symbol::{kw, sym};
 use syntax::parse::token::{self, Token};
@@ -31,7 +31,7 @@ impl<'a> DefCollector<'a> {
         self.definitions.create_def_with_parent(parent_def, node_id, data, self.expansion, span)
     }
 
-    pub fn with_parent<F: FnOnce(&mut Self)>(&mut self, parent_def: DefIndex, f: F) {
+    fn with_parent<F: FnOnce(&mut Self)>(&mut self, parent_def: DefIndex, f: F) {
         let orig_parent_def = std::mem::replace(&mut self.parent_def, parent_def);
         f(self);
         self.parent_def = orig_parent_def;
@@ -74,6 +74,22 @@ impl<'a> DefCollector<'a> {
         })
     }
 
+    fn collect_field(&mut self, field: &'a StructField, index: Option<usize>) {
+        if field.is_placeholder {
+            self.visit_macro_invoc(field.id);
+        } else {
+            let name = field.ident.map(|ident| ident.name)
+                .or_else(|| index.map(sym::integer))
+                .unwrap_or_else(|| {
+                    let node_id = NodeId::placeholder_from_expn_id(self.expansion);
+                    sym::integer(self.definitions.placeholder_field_indices[&node_id])
+                })
+                .as_interned_str();
+            let def = self.create_def(field.id, DefPathData::ValueNs(name), field.span);
+            self.with_parent(def, |this| visit::walk_struct_field(this, field));
+        }
+    }
+
     pub fn visit_macro_invoc(&mut self, id: NodeId) {
         self.definitions.set_invocation_parent(id.placeholder_to_expn_id(), self.parent_def);
     }
@@ -85,7 +101,7 @@ impl<'a> visit::Visitor<'a> for DefCollector<'a> {
 
         // Pick the def data. This need not be unique, but the more
         // information we encapsulate into, the better
-        let def_data = match i.node {
+        let def_data = match i.kind {
             ItemKind::Impl(..) => DefPathData::Impl,
             ItemKind::Mod(..) if i.ident.name == kw::Invalid => {
                 return visit::walk_item(self, i);
@@ -122,7 +138,7 @@ impl<'a> visit::Visitor<'a> for DefCollector<'a> {
         let def = self.create_def(i.id, def_data, i.span);
 
         self.with_parent(def, |this| {
-            match i.node {
+            match i.kind {
                 ItemKind::Struct(ref struct_def, _) | ItemKind::Union(ref struct_def, _) => {
                     // If this is a unit or tuple-like struct, register the constructor.
                     if let Some(ctor_hir_id) = struct_def.ctor_id() {
@@ -141,7 +157,7 @@ impl<'a> visit::Visitor<'a> for DefCollector<'a> {
     }
 
     fn visit_foreign_item(&mut self, foreign_item: &'a ForeignItem) {
-        if let ForeignItemKind::Macro(_) = foreign_item.node {
+        if let ForeignItemKind::Macro(_) = foreign_item.kind {
             return self.visit_macro_invoc(foreign_item.id);
         }
 
@@ -155,6 +171,9 @@ impl<'a> visit::Visitor<'a> for DefCollector<'a> {
     }
 
     fn visit_variant(&mut self, v: &'a Variant) {
+        if v.is_placeholder {
+            return self.visit_macro_invoc(v.id);
+        }
         let def = self.create_def(v.id,
                                   DefPathData::TypeNs(v.ident.as_interned_str()),
                                   v.span);
@@ -167,17 +186,22 @@ impl<'a> visit::Visitor<'a> for DefCollector<'a> {
     }
 
     fn visit_variant_data(&mut self, data: &'a VariantData) {
+        // The assumption here is that non-`cfg` macro expansion cannot change field indices.
+        // It currently holds because only inert attributes are accepted on fields,
+        // and every such attribute expands into a single field after it's resolved.
         for (index, field) in data.fields().iter().enumerate() {
-            let name = field.ident.map(|ident| ident.name)
-                .unwrap_or_else(|| sym::integer(index));
-            let def = self.create_def(field.id,
-                                      DefPathData::ValueNs(name.as_interned_str()),
-                                      field.span);
-            self.with_parent(def, |this| this.visit_struct_field(field));
+            self.collect_field(field, Some(index));
+            if field.is_placeholder && field.ident.is_none() {
+                self.definitions.placeholder_field_indices.insert(field.id, index);
+            }
         }
     }
 
     fn visit_generic_param(&mut self, param: &'a GenericParam) {
+        if param.is_placeholder {
+            self.visit_macro_invoc(param.id);
+            return;
+        }
         let name = param.ident.as_interned_str();
         let def_path_data = match param.kind {
             GenericParamKind::Lifetime { .. } => DefPathData::LifetimeNs(name),
@@ -190,7 +214,7 @@ impl<'a> visit::Visitor<'a> for DefCollector<'a> {
     }
 
     fn visit_trait_item(&mut self, ti: &'a TraitItem) {
-        let def_data = match ti.node {
+        let def_data = match ti.kind {
             TraitItemKind::Method(..) | TraitItemKind::Const(..) =>
                 DefPathData::ValueNs(ti.ident.as_interned_str()),
             TraitItemKind::Type(..) => {
@@ -204,7 +228,7 @@ impl<'a> visit::Visitor<'a> for DefCollector<'a> {
     }
 
     fn visit_impl_item(&mut self, ii: &'a ImplItem) {
-        let def_data = match ii.node {
+        let def_data = match ii.kind {
             ImplItemKind::Method(MethodSig {
                 ref header,
                 ref decl,
@@ -233,7 +257,7 @@ impl<'a> visit::Visitor<'a> for DefCollector<'a> {
     }
 
     fn visit_pat(&mut self, pat: &'a Pat) {
-        match pat.node {
+        match pat.kind {
             PatKind::Mac(..) => return self.visit_macro_invoc(pat.id),
             _ => visit::walk_pat(self, pat),
         }
@@ -247,7 +271,7 @@ impl<'a> visit::Visitor<'a> for DefCollector<'a> {
     }
 
     fn visit_expr(&mut self, expr: &'a Expr) {
-        let parent_def = match expr.node {
+        let parent_def = match expr.kind {
             ExprKind::Mac(..) => return self.visit_macro_invoc(expr.id),
             ExprKind::Closure(_, asyncness, ..) => {
                 // Async closures desugar to closures inside of closures, so
@@ -268,7 +292,7 @@ impl<'a> visit::Visitor<'a> for DefCollector<'a> {
     }
 
     fn visit_ty(&mut self, ty: &'a Ty) {
-        match ty.node {
+        match ty.kind {
             TyKind::Mac(..) => return self.visit_macro_invoc(ty.id),
             TyKind::ImplTrait(node_id, _) => {
                 self.create_def(node_id, DefPathData::ImplTrait, ty.span);
@@ -279,7 +303,7 @@ impl<'a> visit::Visitor<'a> for DefCollector<'a> {
     }
 
     fn visit_stmt(&mut self, stmt: &'a Stmt) {
-        match stmt.node {
+        match stmt.kind {
             StmtKind::Mac(..) => self.visit_macro_invoc(stmt.id),
             _ => visit::walk_stmt(self, stmt),
         }
@@ -288,10 +312,48 @@ impl<'a> visit::Visitor<'a> for DefCollector<'a> {
     fn visit_token(&mut self, t: Token) {
         if let token::Interpolated(nt) = t.kind {
             if let token::NtExpr(ref expr) = *nt {
-                if let ExprKind::Mac(..) = expr.node {
+                if let ExprKind::Mac(..) = expr.kind {
                     self.visit_macro_invoc(expr.id);
                 }
             }
         }
+    }
+
+    fn visit_arm(&mut self, arm: &'a Arm) {
+        if arm.is_placeholder {
+            self.visit_macro_invoc(arm.id)
+        } else {
+            visit::walk_arm(self, arm)
+        }
+    }
+
+    fn visit_field(&mut self, f: &'a Field) {
+        if f.is_placeholder {
+            self.visit_macro_invoc(f.id)
+        } else {
+            visit::walk_field(self, f)
+        }
+    }
+
+    fn visit_field_pattern(&mut self, fp: &'a FieldPat) {
+        if fp.is_placeholder {
+            self.visit_macro_invoc(fp.id)
+        } else {
+            visit::walk_field_pattern(self, fp)
+        }
+    }
+
+    fn visit_param(&mut self, p: &'a Param) {
+        if p.is_placeholder {
+            self.visit_macro_invoc(p.id)
+        } else {
+            visit::walk_param(self, p)
+        }
+    }
+
+    // This method is called only when we are visiting an individual field
+    // after expanding an attribute on it.
+    fn visit_struct_field(&mut self, field: &'a StructField) {
+        self.collect_field(field, None);
     }
 }

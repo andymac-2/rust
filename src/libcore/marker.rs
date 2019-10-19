@@ -290,7 +290,6 @@ pub trait Copy : Clone {
 
 /// Derive macro generating an impl of the trait `Copy`.
 #[rustc_builtin_macro]
-#[cfg_attr(boostrap_stdarch_ignore_this, rustc_macro_transparency = "semitransparent")]
 #[stable(feature = "builtin_macro_prelude", since = "1.38.0")]
 #[allow_internal_unstable(core_intrinsics, derive_clone_copy)]
 pub macro Copy($item:item) { /* compiler built-in */ }
@@ -602,10 +601,10 @@ unsafe impl<T: ?Sized> Freeze for *mut T {}
 unsafe impl<T: ?Sized> Freeze for &T {}
 unsafe impl<T: ?Sized> Freeze for &mut T {}
 
-/// Types which can be safely moved after being pinned.
+/// Types that can be safely moved after being pinned.
 ///
 /// Since Rust itself has no notion of immovable types, and considers moves
-/// (e.g. through assignment or [`mem::replace`]) to always be safe,
+/// (e.g., through assignment or [`mem::replace`]) to always be safe,
 /// this trait cannot prevent types from moving by itself.
 ///
 /// Instead it is used to prevent moves through the type system,

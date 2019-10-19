@@ -10,7 +10,7 @@ use rustc::session::Session;
 use rustc::ty::{self, DefIdTree};
 use rustc::util::nodemap::FxHashSet;
 use syntax::ast::{self, Ident, Path};
-use syntax::ext::base::MacroKind;
+use syntax_expand::base::MacroKind;
 use syntax::feature_gate::BUILTIN_ATTRIBUTES;
 use syntax::source_map::SourceMap;
 use syntax::struct_span_err;
@@ -20,7 +20,7 @@ use syntax_pos::{BytePos, Span, MultiSpan};
 
 use crate::resolve_imports::{ImportDirective, ImportDirectiveSubclass, ImportResolver};
 use crate::{path_names_to_string, KNOWN_TOOLS};
-use crate::{BindingError, CrateLint, LegacyScope, Module, ModuleOrUniformRoot};
+use crate::{BindingError, CrateLint, HasGenericParams, LegacyScope, Module, ModuleOrUniformRoot};
 use crate::{PathResult, ParentScope, ResolutionError, Resolver, Scope, ScopeSet, Segment};
 
 type Res = def::Res<ast::NodeId>;
@@ -80,11 +80,11 @@ impl<'a> Resolver<'a> {
         names: &mut Vec<TypoSuggestion>,
         filter_fn: &impl Fn(Res) -> bool,
     ) {
-        for (&(ident, _), resolution) in self.resolutions(module).borrow().iter() {
+        for (key, resolution) in self.resolutions(module).borrow().iter() {
             if let Some(binding) = resolution.borrow().binding {
                 let res = binding.res();
                 if filter_fn(res) {
-                    names.push(TypoSuggestion::from_res(ident.name, res));
+                    names.push(TypoSuggestion::from_res(key.ident.name, res));
                 }
             }
         }
@@ -102,7 +102,7 @@ impl<'a> Resolver<'a> {
         &self, span: Span, resolution_error: ResolutionError<'_>
     ) -> DiagnosticBuilder<'_> {
         match resolution_error {
-            ResolutionError::GenericParamsFromOuterFunction(outer_res) => {
+            ResolutionError::GenericParamsFromOuterFunction(outer_res, has_generic_params) => {
                 let mut err = struct_span_err!(self.session,
                     span,
                     E0401,
@@ -148,22 +148,24 @@ impl<'a> Resolver<'a> {
                     }
                 }
 
-                // Try to retrieve the span of the function signature and generate a new message
-                // with a local type or const parameter.
-                let sugg_msg = &format!("try using a local generic parameter instead");
-                if let Some((sugg_span, new_snippet)) = cm.generate_local_type_param_snippet(span) {
-                    // Suggest the modification to the user
-                    err.span_suggestion(
-                        sugg_span,
-                        sugg_msg,
-                        new_snippet,
-                        Applicability::MachineApplicable,
-                    );
-                } else if let Some(sp) = cm.generate_fn_name_span(span) {
-                    err.span_label(sp,
-                        format!("try adding a local generic parameter in this method instead"));
-                } else {
-                    err.help(&format!("try using a local generic parameter instead"));
+                if has_generic_params == HasGenericParams::Yes {
+                    // Try to retrieve the span of the function signature and generate a new
+                    // message with a local type or const parameter.
+                    let sugg_msg = &format!("try using a local generic parameter instead");
+                    if let Some((sugg_span, snippet)) = cm.generate_local_type_param_snippet(span) {
+                        // Suggest the modification to the user
+                        err.span_suggestion(
+                            sugg_span,
+                            sugg_msg,
+                            snippet,
+                            Applicability::MachineApplicable,
+                        );
+                    } else if let Some(sp) = cm.generate_fn_name_span(span) {
+                        err.span_label(sp,
+                            format!("try adding a local generic parameter in this method instead"));
+                    } else {
+                        err.help(&format!("try using a local generic parameter instead"));
+                    }
                 }
 
                 err
@@ -354,6 +356,17 @@ impl<'a> Resolver<'a> {
                     span, "defaulted type parameters cannot be forward declared".to_string());
                 err
             }
+            ResolutionError::SelfInTyParamDefault => {
+                let mut err = struct_span_err!(
+                    self.session,
+                    span,
+                    E0735,
+                    "type parameters cannot use `Self` in their defaults"
+                );
+                err.span_label(
+                    span, "`Self` in type parameter default".to_string());
+                err
+            }
             ResolutionError::ConstParamDependentOnTypeParam => {
                 let mut err = struct_span_err!(
                     self.session,
@@ -516,7 +529,7 @@ impl<'a> Resolver<'a> {
                         in_module_is_extern)) = worklist.pop() {
             // We have to visit module children in deterministic order to avoid
             // instabilities in reported imports (#43552).
-            in_module.for_each_child_stable(self, |this, ident, ns, name_binding| {
+            in_module.for_each_child(self, |this, ident, ns, name_binding| {
                 // avoid imports entirely
                 if name_binding.is_import() && !name_binding.is_extern_crate() { return; }
                 // avoid non-importable candidates as well
@@ -604,6 +617,14 @@ impl<'a> Resolver<'a> {
         if lookup_ident.span.rust_2018() {
             let extern_prelude_names = self.extern_prelude.clone();
             for (ident, _) in extern_prelude_names.into_iter() {
+                if ident.span.from_expansion() {
+                    // Idents are adjusted to the root context before being
+                    // resolved in the extern prelude, so reporting this to the
+                    // user is no help. This skips the injected
+                    // `extern crate std` in the 2018 edition, which would
+                    // otherwise cause duplicate suggestions.
+                    continue;
+                }
                 if let Some(crate_id) = self.crate_loader.maybe_process_path_extern(ident.name,
                                                                                     ident.span) {
                     let crate_root = self.get_module(DefId {
@@ -828,7 +849,7 @@ impl<'a, 'b> ImportResolver<'a, 'b> {
         }
 
         let resolutions = self.r.resolutions(crate_module).borrow();
-        let resolution = resolutions.get(&(ident, MacroNS))?;
+        let resolution = resolutions.get(&self.r.new_key(ident, MacroNS))?;
         let binding = resolution.borrow().binding()?;
         if let Res::Def(DefKind::Macro(MacroKind::Bang), _) = binding.res() {
             let module_name = crate_module.kind.name().unwrap();

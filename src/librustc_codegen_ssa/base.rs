@@ -29,25 +29,22 @@ use rustc::util::common::{time, print_time_passes_entry, set_time_depth, time_de
 use rustc::session::config::{self, EntryFnType, Lto};
 use rustc::session::Session;
 use rustc::util::nodemap::FxHashMap;
-use rustc_data_structures::indexed_vec::Idx;
+use rustc_index::vec::Idx;
 use rustc_codegen_utils::{symbol_names_test, check_for_rustc_errors_attr};
 use rustc::ty::layout::{FAT_PTR_ADDR, FAT_PTR_EXTRA};
 use crate::mir::place::PlaceRef;
 use crate::back::write::{OngoingCodegen, start_async_codegen, submit_pre_lto_module_to_llvm,
     submit_post_lto_module_to_llvm};
 use crate::{MemFlags, CrateInfo};
-use crate::callee;
 use crate::common::{RealPredicate, TypeKind, IntPredicate};
 use crate::meth;
 use crate::mir;
 
 use crate::traits::*;
 
-use std::any::Any;
 use std::cmp;
 use std::ops::{Deref, DerefMut};
 use std::time::{Instant, Duration};
-use std::sync::mpsc;
 use syntax_pos::Span;
 use syntax::attr;
 use rustc::hir;
@@ -96,7 +93,7 @@ pub fn compare_simd_types<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     ret_ty: Bx::Type,
     op: hir::BinOpKind,
 ) -> Bx::Value {
-    let signed = match t.sty {
+    let signed = match t.kind {
         ty::Float(_) => {
             let cmp = bin_op_to_fcmp_predicate(op);
             let cmp = bx.fcmp(cmp, lhs, rhs);
@@ -130,7 +127,7 @@ pub fn unsized_info<'tcx, Cx: CodegenMethods<'tcx>>(
 ) -> Cx::Value {
     let (source, target) =
         cx.tcx().struct_lockstep_tails_erasing_lifetimes(source, target, cx.param_env());
-    match (&source.sty, &target.sty) {
+    match (&source.kind, &target.kind) {
         (&ty::Array(_, len), &ty::Slice(_)) => {
             cx.const_usize(len.eval_usize(cx.tcx(), ty::ParamEnv::reveal_all()))
         }
@@ -160,7 +157,7 @@ pub fn unsize_thin_ptr<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     dst_ty: Ty<'tcx>,
 ) -> (Bx::Value, Bx::Value) {
     debug!("unsize_thin_ptr: {:?} => {:?}", src_ty, dst_ty);
-    match (&src_ty.sty, &dst_ty.sty) {
+    match (&src_ty.kind, &dst_ty.kind) {
         (&ty::Ref(_, a, _),
          &ty::Ref(_, b, _)) |
         (&ty::Ref(_, a, _),
@@ -232,7 +229,7 @@ pub fn coerce_unsized_into<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         };
         OperandValue::Pair(base, info).store(bx, dst);
     };
-    match (&src_ty.sty, &dst_ty.sty) {
+    match (&src_ty.kind, &dst_ty.kind) {
         (&ty::Ref(..), &ty::Ref(..)) |
         (&ty::Ref(..), &ty::RawPtr(..)) |
         (&ty::RawPtr(..), &ty::RawPtr(..)) => {
@@ -379,8 +376,7 @@ pub fn codegen_instance<'a, 'tcx: 'a, Bx: BuilderMethods<'a, 'tcx>>(
     let sig = instance.fn_sig(cx.tcx());
     let sig = cx.tcx().normalize_erasing_late_bound_regions(ty::ParamEnv::reveal_all(), &sig);
 
-    let lldecl = cx.instances().borrow().get(&instance).cloned().unwrap_or_else(||
-        bug!("Instance `{:?}` not already declared", instance));
+    let lldecl = cx.get_fn(instance);
 
     let mir = cx.tcx().instance_mir(instance.def);
     mir::codegen_mir::<Bx>(cx, lldecl, &mir, instance, sig);
@@ -402,7 +398,7 @@ pub fn maybe_create_entry_wrapper<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(cx: &'
         return;
     }
 
-    let main_llfn = cx.get_fn(instance);
+    let main_llfn = cx.get_fn_addr(instance);
 
     let et = cx.tcx().entry_fn(LOCAL_CRATE).map(|e| e.1);
     match et {
@@ -456,11 +452,14 @@ pub fn maybe_create_entry_wrapper<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(cx: &'
         let arg_argv = param_argv;
 
         let (start_fn, args) = if use_start_lang_item {
-            let start_def_id = cx.tcx().require_lang_item(StartFnLangItem);
-            let start_fn = callee::resolve_and_get_fn(
-                cx,
-                start_def_id,
-                cx.tcx().intern_substs(&[main_ret_ty.into()]),
+            let start_def_id = cx.tcx().require_lang_item(StartFnLangItem, None);
+            let start_fn = cx.get_fn_addr(
+                ty::Instance::resolve(
+                    cx.tcx(),
+                    ty::ParamEnv::reveal_all(),
+                    start_def_id,
+                    cx.tcx().intern_substs(&[main_ret_ty.into()]),
+                ).unwrap()
             );
             (start_fn, vec![bx.pointercast(rust_main, cx.type_ptr_to(cx.type_i8p())),
                             arg_argc, arg_argv])
@@ -482,19 +481,13 @@ pub fn codegen_crate<B: ExtraBackendMethods>(
     tcx: TyCtxt<'tcx>,
     metadata: EncodedMetadata,
     need_metadata_module: bool,
-    rx: mpsc::Receiver<Box<dyn Any + Send>>,
 ) -> OngoingCodegen<B> {
     check_for_rustc_errors_attr(tcx);
 
     // Skip crate items and just output metadata in -Z no-codegen mode.
     if tcx.sess.opts.debugging_opts.no_codegen ||
        !tcx.sess.opts.output_types.should_codegen() {
-        let ongoing_codegen = start_async_codegen(
-            backend,
-            tcx,
-            metadata,
-            rx,
-            1);
+        let ongoing_codegen = start_async_codegen(backend, tcx, metadata, 1);
 
         ongoing_codegen.codegen_finished(tcx);
 
@@ -523,12 +516,7 @@ pub fn codegen_crate<B: ExtraBackendMethods>(
         }
     }
 
-    let ongoing_codegen = start_async_codegen(
-        backend.clone(),
-        tcx,
-        metadata,
-        rx,
-        codegen_units.len());
+    let ongoing_codegen = start_async_codegen(backend.clone(), tcx, metadata, codegen_units.len());
     let ongoing_codegen = AbortCodegenOnDrop::<B>(Some(ongoing_codegen));
 
     // Codegen an allocator shim, if necessary.
@@ -539,7 +527,7 @@ pub fn codegen_crate<B: ExtraBackendMethods>(
     // linkage, then it's already got an allocator shim and we'll be using that
     // one instead. If nothing exists then it's our job to generate the
     // allocator!
-    let any_dynamic_crate = tcx.sess.dependency_formats.borrow()
+    let any_dynamic_crate = tcx.dependency_formats(LOCAL_CRATE)
         .iter()
         .any(|(_, list)| {
             use rustc::middle::dependency_format::Linkage;
@@ -572,7 +560,7 @@ pub fn codegen_crate<B: ExtraBackendMethods>(
 
     if need_metadata_module {
         // Codegen the encoded metadata.
-        tcx.sess.profiler(|p| p.start_activity("codegen crate metadata"));
+        let _prof_timer = tcx.prof.generic_activity("codegen_crate_metadata");
 
         let metadata_cgu_name = cgu_name_builder.build_cgu_name(LOCAL_CRATE,
                                                                 &["crate"],
@@ -583,7 +571,6 @@ pub fn codegen_crate<B: ExtraBackendMethods>(
             backend.write_compressed_metadata(tcx, &ongoing_codegen.metadata,
                                               &mut metadata_llvm_module);
         });
-        tcx.sess.profiler(|p| p.end_activity("codegen crate metadata"));
 
         let metadata_module = ModuleCodegen {
             name: metadata_cgu_name,
@@ -612,22 +599,22 @@ pub fn codegen_crate<B: ExtraBackendMethods>(
 
         match cgu_reuse {
             CguReuse::No => {
-                tcx.sess.profiler(|p| p.start_activity(format!("codegen {}", cgu.name())));
                 let start_time = Instant::now();
-                backend.compile_codegen_unit(tcx, *cgu.name());
+                backend.compile_codegen_unit(tcx, *cgu.name(), &ongoing_codegen.coordinator_send);
                 total_codegen_time += start_time.elapsed();
-                tcx.sess.profiler(|p| p.end_activity(format!("codegen {}", cgu.name())));
                 false
             }
             CguReuse::PreLto => {
-                submit_pre_lto_module_to_llvm(&backend, tcx, CachedModuleCodegen {
+                submit_pre_lto_module_to_llvm(&backend, tcx, &ongoing_codegen.coordinator_send,
+                CachedModuleCodegen {
                     name: cgu.name().to_string(),
                     source: cgu.work_product(tcx),
                 });
                 true
             }
             CguReuse::PostLto => {
-                submit_post_lto_module_to_llvm(&backend, tcx, CachedModuleCodegen {
+                submit_post_lto_module_to_llvm(&backend, &ongoing_codegen.coordinator_send,
+                CachedModuleCodegen {
                     name: cgu.name().to_string(),
                     source: cgu.work_product(tcx),
                 });
@@ -731,6 +718,7 @@ impl CrateInfo {
             used_crate_source: Default::default(),
             lang_item_to_crate: Default::default(),
             missing_lang_items: Default::default(),
+            dependency_formats: tcx.dependency_formats(LOCAL_CRATE),
         };
         let lang_items = tcx.lang_items();
 

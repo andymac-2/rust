@@ -32,6 +32,12 @@ pub struct CrateSource {
     pub rmeta: Option<(PathBuf, PathKind)>,
 }
 
+impl CrateSource {
+    pub fn paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.dylib.iter().chain(self.rlib.iter()).chain(self.rmeta.iter()).map(|p| &p.0)
+    }
+}
+
 #[derive(RustcEncodable, RustcDecodable, Copy, Clone,
          Ord, PartialOrd, Eq, PartialEq, Debug, HashStable)]
 pub enum DepKind {
@@ -96,6 +102,8 @@ pub enum NativeLibraryKind {
     NativeStaticNobundle,
     /// macOS-specific
     NativeFramework,
+    /// Windows dynamic library without import library.
+    NativeRawDylib,
     /// default way to specify a dynamic library
     NativeUnknown,
 }
@@ -126,10 +134,17 @@ pub struct ExternCrate {
     /// used to select the extern with the shortest path
     pub path_len: usize,
 
+    /// Crate that depends on this crate
+    pub dependency_of: CrateNum,
+}
+
+impl ExternCrate {
     /// If true, then this crate is the crate named by the extern
     /// crate referenced above. If false, then this crate is a dep
     /// of the crate.
-    pub direct: bool,
+    pub fn is_direct(&self) -> bool {
+        self.dependency_of == LOCAL_CRATE
+    }
 }
 
 #[derive(Copy, Clone, Debug, HashStable)]
@@ -141,9 +156,7 @@ pub enum ExternCrateSource {
         /// such ids
         DefId,
     ),
-    // Crate is loaded by `use`.
-    Use,
-    /// Crate is implicitly loaded by an absolute path.
+    /// Crate is implicitly loaded by a path resolving through extern prelude.
     Path,
 }
 
@@ -201,7 +214,6 @@ pub trait CrateStore {
     fn crate_is_private_dep_untracked(&self, cnum: CrateNum) -> bool;
     fn crate_disambiguator_untracked(&self, cnum: CrateNum) -> CrateDisambiguator;
     fn crate_hash_untracked(&self, cnum: CrateNum) -> Svh;
-    fn extern_mod_stmt_cnum_untracked(&self, emod_id: ast::NodeId) -> Option<CrateNum>;
     fn item_generics_cloned_untracked(&self, def: DefId, sess: &Session) -> ty::Generics;
     fn postorder_cnums_untracked(&self) -> Vec<CrateNum>;
 

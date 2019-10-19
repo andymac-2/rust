@@ -57,7 +57,7 @@ function onEachLazy(lazyArray, func, reversed) {
 
 function usableLocalStorage() {
     // Check if the browser supports localStorage at all:
-    if (typeof(Storage) === "undefined") {
+    if (typeof Storage === "undefined") {
         return false;
     }
     // Check if we can access it; this access will fail if the browser
@@ -118,7 +118,8 @@ function switchTheme(styleElem, mainStyleElem, newTheme, saveTheme) {
 }
 
 function getSystemValue() {
-    return getComputedStyle(document.documentElement).getPropertyValue('content');
+    var property = getComputedStyle(document.documentElement).getPropertyValue('content');
+    return property.replace(/[\"\']/g, "");
 }
 
 switchTheme(currentTheme, mainTheme,

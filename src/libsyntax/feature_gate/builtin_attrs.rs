@@ -9,8 +9,8 @@ use super::active::Features;
 
 use crate::ast;
 use crate::attr::AttributeTemplate;
+use crate::sess::ParseSess;
 use crate::symbol::{Symbol, sym};
-use crate::parse::ParseSess;
 
 use syntax_pos::Span;
 use rustc_data_structures::fx::FxHashMap;
@@ -29,6 +29,7 @@ const GATED_CFGS: &[(Symbol, Symbol, GateFn)] = &[
     // (name in cfg, feature, function to check if the feature is enabled)
     (sym::target_thread_local, sym::cfg_target_thread_local, cfg_fn!(cfg_target_thread_local)),
     (sym::target_has_atomic, sym::cfg_target_has_atomic, cfg_fn!(cfg_target_has_atomic)),
+    (sym::target_has_atomic_load_store, sym::cfg_target_has_atomic, cfg_fn!(cfg_target_has_atomic)),
     (sym::rustdoc, sym::doc_cfg, cfg_fn!(doc_cfg)),
     (sym::doctest, sym::cfg_doctest, cfg_fn!(cfg_doctest)),
 ];
@@ -79,6 +80,7 @@ pub enum AttributeType {
     CrateLevel,
 }
 
+#[derive(Clone, Copy)]
 pub enum AttributeGate {
     /// Is gated by a given feature gate, reason
     /// and function to check if enabled
@@ -169,7 +171,7 @@ const INTERAL_UNSTABLE: &str = "this is an internal attribute that will never be
 
 pub type BuiltinAttribute = (Symbol, AttributeType, AttributeTemplate, AttributeGate);
 
-/// Attributes that have a special meaning to rustc or rustdoc
+/// Attributes that have a special meaning to rustc or rustdoc.
 pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     // ==========================================================================
     // Stable attributes:
@@ -275,12 +277,35 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
         "the `link_args` attribute is experimental and not portable across platforms, \
         it is recommended to use `#[link(name = \"foo\")] instead",
     ),
+    gated!(
+        link_ordinal, Whitelisted, template!(List: "ordinal"), raw_dylib,
+        experimental!(link_ordinal)
+    ),
 
     // Plugins:
-    ungated!(plugin_registrar, Normal, template!(Word)),
-    gated!(
-        plugin, CrateLevel, template!(List: "name|name(args)"),
-        "compiler plugins are experimental and possibly buggy",
+    (
+        sym::plugin_registrar, Normal, template!(Word),
+        Gated(
+            Stability::Deprecated(
+                "https://github.com/rust-lang/rust/pull/64675",
+                Some("may be removed in a future compiler version"),
+            ),
+            sym::plugin_registrar,
+            "compiler plugins are deprecated",
+            cfg_fn!(plugin_registrar)
+        )
+    ),
+    (
+        sym::plugin, CrateLevel, template!(List: "name|name(args)"),
+        Gated(
+            Stability::Deprecated(
+                "https://github.com/rust-lang/rust/pull/64675",
+                Some("may be removed in a future compiler version"),
+            ),
+            sym::plugin,
+            "compiler plugins are deprecated",
+            cfg_fn!(plugin)
+        )
     ),
 
     // Testing:
@@ -306,6 +331,7 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     ),
 
     gated!(ffi_returns_twice, Whitelisted, template!(Word), experimental!(ffi_returns_twice)),
+    gated!(track_caller, Whitelisted, template!(Word), experimental!(track_caller)),
 
     // ==========================================================================
     // Internal attributes: Stability, deprecation, and unsafe:
@@ -456,10 +482,20 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
     // ==========================================================================
     // Internal attributes, Misc:
     // ==========================================================================
-
     gated!(
         lang, Normal, template!(NameValueStr: "name"), lang_items,
         "language items are subject to change",
+    ),
+    (
+        sym::rustc_diagnostic_item,
+        Normal,
+        template!(NameValueStr: "name"),
+        Gated(
+            Stability::Unstable,
+            sym::rustc_attrs,
+            "diagnostic items compiler internal support for linting",
+            cfg_fn!(rustc_attrs),
+        ),
     ),
     (
         sym::no_debug, Whitelisted, template!(Word),
@@ -485,6 +521,10 @@ pub const BUILTIN_ATTRIBUTES: &[BuiltinAttribute] = &[
         "the `#[rustc_inherit_overflow_checks]` attribute is just used to control \
         overflow checking behavior of several libcore functions that are inlined \
         across crates and will never be stable",
+    ),
+    rustc_attr!(rustc_reservation_impl, Normal, template!(NameValueStr: "reservation message"),
+                "the `#[rustc_reservation_impl]` attribute is internally used \
+                 for reserving for `for<T> From<!> for T` impl"
     ),
     rustc_attr!(
         rustc_test_marker, Normal, template!(Word),

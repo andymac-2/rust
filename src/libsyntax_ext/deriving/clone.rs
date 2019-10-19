@@ -3,7 +3,7 @@ use crate::deriving::generic::*;
 use crate::deriving::generic::ty::*;
 
 use syntax::ast::{self, Expr, GenericArg, Generics, ItemKind, MetaItem, VariantData};
-use syntax::ext::base::{Annotatable, ExtCtxt, SpecialDerives};
+use syntax_expand::base::{Annotatable, ExtCtxt, SpecialDerives};
 use syntax::ptr::P;
 use syntax::symbol::{kw, sym, Symbol};
 use syntax_pos::Span;
@@ -32,7 +32,7 @@ pub fn expand_deriving_clone(cx: &mut ExtCtxt<'_>,
     let is_shallow;
     match *item {
         Annotatable::Item(ref annitem) => {
-            match annitem.node {
+            match annitem.kind {
                 ItemKind::Struct(_, Generics { ref params, .. }) |
                 ItemKind::Enum(_, Generics { ref params, .. }) => {
                     let container_id = cx.current_expansion.id.expn_data().parent;
@@ -115,7 +115,7 @@ fn cs_clone_shallow(name: &str,
         let span = cx.with_def_site_ctxt(span);
         let assert_path = cx.path_all(span, true,
                                         cx.std_path(&[sym::clone, Symbol::intern(helper_name)]),
-                                        vec![GenericArg::Type(ty)], vec![]);
+                                        vec![GenericArg::Type(ty)]);
         stmts.push(cx.stmt_let_type_only(span, cx.ty_path(assert_path)));
     }
     fn process_variant(cx: &mut ExtCtxt<'_>, stmts: &mut Vec<ast::Stmt>, variant: &VariantData) {

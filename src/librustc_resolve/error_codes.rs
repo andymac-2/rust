@@ -1,18 +1,16 @@
-use syntax::{register_diagnostics, register_long_diagnostics};
-
 // Error messages for EXXXX errors.  Each message should start and end with a
 // new line, and be wrapped to 80 characters.  In vim you can `:set tw=80` and
 // use `gq` to wrap paragraphs. Use `:set tw=0` to disable.
-register_long_diagnostics! {
+syntax::register_diagnostics! {
 
 E0128: r##"
 Type parameter defaults can only use parameters that occur before them.
 Erroneous code example:
 
 ```compile_fail,E0128
-struct Foo<T=U, U=()> {
+struct Foo<T = U, U = ()> {
     field1: T,
-    filed2: U,
+    field2: U,
 }
 // error: type parameters with a default cannot use forward declared
 // identifiers
@@ -22,9 +20,9 @@ Since type parameters are evaluated in-order, you may be able to fix this issue
 by doing:
 
 ```
-struct Foo<U=(), T=U> {
+struct Foo<U = (), T = U> {
     field1: T,
-    filed2: U,
+    field2: U,
 }
 ```
 
@@ -1527,6 +1525,51 @@ match r {
 ```
 "##,
 
+E0531: r##"
+An unknown tuple struct/variant has been used.
+
+Erroneous code example:
+
+```compile_fail,E0531
+let Type(x) = Type(12); // error!
+match Bar(12) {
+    Bar(x) => {} // error!
+    _ => {}
+}
+```
+
+In most cases, it's either a forgotten import or a typo. However, let's look at
+how you can have such a type:
+
+```edition2018
+struct Type(u32); // this is a tuple struct
+
+enum Foo {
+    Bar(u32), // this is a tuple variant
+}
+
+use Foo::*; // To use Foo's variant directly, we need to import them in
+            // the scope.
+```
+
+Either way, it should work fine with our previous code:
+
+```edition2018
+struct Type(u32);
+
+enum Foo {
+    Bar(u32),
+}
+use Foo::*;
+
+let Type(x) = Type(12); // ok!
+match Type(12) {
+    Type(x) => {} // ok!
+    _ => {}
+}
+```
+"##,
+
 E0532: r##"
 Pattern arm did not match expected kind.
 
@@ -1565,6 +1608,183 @@ fn print_on_failure(state: &State) {
         _ => ()
     }
 }
+```
+"##,
+
+E0573: r##"
+Something other than a type has been used when one was expected.
+
+Erroneous code examples:
+
+```compile_fail,E0573
+enum Dragon {
+    Born,
+}
+
+fn oblivion() -> Dragon::Born { // error!
+    Dragon::Born
+}
+
+const HOBBIT: u32 = 2;
+impl HOBBIT {} // error!
+
+enum Wizard {
+    Gandalf,
+    Saruman,
+}
+
+trait Isengard {
+    fn wizard(_: Wizard::Saruman); // error!
+}
+```
+
+In all these errors, a type was expected. For example, in the first error, if
+we want to return the `Born` variant from the `Dragon` enum, we must set the
+function to return the enum and not its variant:
+
+```
+enum Dragon {
+    Born,
+}
+
+fn oblivion() -> Dragon { // ok!
+    Dragon::Born
+}
+```
+
+In the second error, you can't implement something on an item, only on types.
+We would need to create a new type if we wanted to do something similar:
+
+```
+struct Hobbit(u32); // we create a new type
+
+const HOBBIT: Hobbit = Hobbit(2);
+impl Hobbit {} // ok!
+```
+
+In the third case, we tried to only expect one variant of the `Wizard` enum,
+which is not possible. To make this work, we need to using pattern matching
+over the `Wizard` enum:
+
+```
+enum Wizard {
+    Gandalf,
+    Saruman,
+}
+
+trait Isengard {
+    fn wizard(w: Wizard) { // error!
+        match w {
+            Wizard::Saruman => {
+                // do something
+            }
+            _ => {} // ignore everything else
+        }
+    }
+}
+```
+"##,
+
+E0574: r##"
+Something other than a struct, variant or union has been used when one was
+expected.
+
+Erroneous code example:
+
+```compile_fail,E0574
+mod Mordor {}
+
+let sauron = Mordor { x: () }; // error!
+
+enum Jak {
+    Daxter { i: isize },
+}
+
+let eco = Jak::Daxter { i: 1 };
+match eco {
+    Jak { i } => {} // error!
+}
+```
+
+In all these errors, a type was expected. For example, in the first error,
+we tried to instantiate the `Mordor` module, which is impossible. If you want
+to instantiate a type inside a module, you can do it as follow:
+
+```
+mod Mordor {
+    pub struct TheRing {
+        pub x: usize,
+    }
+}
+
+let sauron = Mordor::TheRing { x: 1 }; // ok!
+```
+
+In the second error, we tried to bind the `Jak` enum directly, which is not
+possible: you can only bind one of its variants. To do so:
+
+```
+enum Jak {
+    Daxter { i: isize },
+}
+
+let eco = Jak::Daxter { i: 1 };
+match eco {
+    Jak::Daxter { i } => {} // ok!
+}
+```
+"##,
+
+E0575: r##"
+Something other than a type or an associated type was given.
+
+Erroneous code example:
+
+```compile_fail,E0575
+enum Rick { Morty }
+
+let _: <u8 as Rick>::Morty; // error!
+
+trait Age {
+    type Empire;
+    fn Mythology() {}
+}
+
+impl Age for u8 {
+    type Empire = u16;
+}
+
+let _: <u8 as Age>::Mythology; // error!
+```
+
+In both cases, we're declaring a variable (called `_`) and we're giving it a
+type. However, `<u8 as Rick>::Morty` and `<u8 as Age>::Mythology` aren't types,
+therefore the compiler throws an error.
+
+`<u8 as Rick>::Morty` is an enum variant, you cannot use a variant as a type,
+you have to use the enum directly:
+
+```
+enum Rick { Morty }
+
+let _: Rick; // ok!
+```
+
+`<u8 as Age>::Mythology` is a trait method, which is definitely not a type.
+However, the `Age` trait provides an associated type `Empire` which can be
+used as a type:
+
+```
+trait Age {
+    type Empire;
+    fn Mythology() {}
+}
+
+impl Age for u8 {
+    type Empire = u16;
+}
+
+let _: <u8 as Age>::Empire; // ok!
 ```
 "##,
 
@@ -1663,9 +1883,21 @@ fn const_id<T, const N: T>() -> T { // error: const parameter
 ```
 "##,
 
-}
+E0735: r##"
+Type parameter defaults cannot use `Self` on structs, enums, or unions.
 
-register_diagnostics! {
+Erroneous code example:
+
+```compile_fail,E0735
+struct Foo<X = Box<Self>> {
+    field1: Option<X>,
+    field2: Option<X>,
+}
+// error: type parameters cannot use `Self` in their defaults.
+```
+"##,
+
+;
 //  E0153, unused error code
 //  E0157, unused error code
 //  E0257,
@@ -1680,13 +1912,9 @@ register_diagnostics! {
 //  E0419, merged into 531
 //  E0420, merged into 532
 //  E0421, merged into 531
-    E0531, // unresolved pattern path kind `name`
 //  E0427, merged into 530
 //  E0467, removed
 //  E0470, removed
-    E0573,
-    E0574,
-    E0575,
     E0576,
     E0577,
     E0578,

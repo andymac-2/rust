@@ -547,7 +547,7 @@ impl<T: ?Sized> Arc<T> {
     ///     let x = Arc::from_raw(x_ptr);
     ///     assert_eq!(&*x, "hello");
     ///
-    ///     // Further calls to `Arc::from_raw(x_ptr)` would be memory unsafe.
+    ///     // Further calls to `Arc::from_raw(x_ptr)` would be memory-unsafe.
     /// }
     ///
     /// // The memory was freed when `x` went out of scope above, so `x_ptr` is now dangling!
@@ -1244,11 +1244,9 @@ impl Arc<dyn Any + Send + Sync> {
     ///     }
     /// }
     ///
-    /// fn main() {
-    ///     let my_string = "Hello World".to_string();
-    ///     print_if_string(Arc::new(my_string));
-    ///     print_if_string(Arc::new(0i8));
-    /// }
+    /// let my_string = "Hello World".to_string();
+    /// print_if_string(Arc::new(my_string));
+    /// print_if_string(Arc::new(0i8));
     /// ```
     pub fn downcast<T>(self) -> Result<Arc<T>, Self>
     where
@@ -1550,19 +1548,18 @@ impl<T: ?Sized> Weak<T> {
         }
     }
 
-    /// Returns `true` if the two `Weak`s point to the same value (not just values
-    /// that compare as equal).
+    /// Returns `true` if the two `Weak`s point to the same value (not just
+    /// values that compare as equal), or if both don't point to any value
+    /// (because they were created with `Weak::new()`).
     ///
     /// # Notes
     ///
     /// Since this compares pointers it means that `Weak::new()` will equal each
     /// other, even though they don't point to any value.
     ///
-    ///
     /// # Examples
     ///
     /// ```
-    /// #![feature(weak_ptr_eq)]
     /// use std::sync::Arc;
     ///
     /// let first_rc = Arc::new(5);
@@ -1580,7 +1577,6 @@ impl<T: ?Sized> Weak<T> {
     /// Comparing `Weak::new`.
     ///
     /// ```
-    /// #![feature(weak_ptr_eq)]
     /// use std::sync::{Arc, Weak};
     ///
     /// let first = Weak::new();
@@ -1592,7 +1588,7 @@ impl<T: ?Sized> Weak<T> {
     /// assert!(!first.ptr_eq(&third));
     /// ```
     #[inline]
-    #[unstable(feature = "weak_ptr_eq", issue = "55981")]
+    #[stable(feature = "weak_ptr_eq", since = "1.39.0")]
     pub fn ptr_eq(&self, other: &Self) -> bool {
         self.ptr.as_ptr() == other.ptr.as_ptr()
     }

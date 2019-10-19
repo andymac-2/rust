@@ -104,7 +104,7 @@ impl<'a, 'tcx> AutoTraitFinder<'a, 'tcx> {
                     // regardless of the choice of `T`.
                     let params = (
                         self.cx.tcx.generics_of(param_env_def_id),
-                        &&self.cx.tcx.common.empty_predicates,
+                        ty::GenericPredicates::default(),
                     ).clean(self.cx).params;
 
                     Generics {
@@ -119,7 +119,7 @@ impl<'a, 'tcx> AutoTraitFinder<'a, 'tcx> {
                 source: Span::empty(),
                 name: None,
                 attrs: Default::default(),
-                visibility: None,
+                visibility: Inherited,
                 def_id: self.cx.next_def_id(param_env_def_id.krate),
                 stability: None,
                 deprecation: None,
@@ -464,7 +464,7 @@ impl<'a, 'tcx> AutoTraitFinder<'a, 'tcx> {
         // it is *not* required (i.e., '?Sized')
         let sized_trait = self.cx
             .tcx
-            .require_lang_item(lang_items::SizedTraitLangItem);
+            .require_lang_item(lang_items::SizedTraitLangItem, None);
 
         let mut replacer = RegionReplacer {
             vid_to_region: &vid_to_region,
@@ -489,7 +489,7 @@ impl<'a, 'tcx> AutoTraitFinder<'a, 'tcx> {
 
         let mut generic_params = (
             tcx.generics_of(param_env_def_id),
-            &tcx.explicit_predicates_of(param_env_def_id),
+            tcx.explicit_predicates_of(param_env_def_id),
         ).clean(self.cx).params;
 
         let mut has_sized = FxHashSet::default();
@@ -777,9 +777,9 @@ impl<'a, 'tcx> AutoTraitFinder<'a, 'tcx> {
     fn is_fn_ty(&self, tcx: TyCtxt<'_>, ty: &Type) -> bool {
         match &ty {
             &&Type::ResolvedPath { ref did, .. } => {
-                *did == tcx.require_lang_item(lang_items::FnTraitLangItem)
-                    || *did == tcx.require_lang_item(lang_items::FnMutTraitLangItem)
-                    || *did == tcx.require_lang_item(lang_items::FnOnceTraitLangItem)
+                *did == tcx.require_lang_item(lang_items::FnTraitLangItem, None)
+                    || *did == tcx.require_lang_item(lang_items::FnMutTraitLangItem, None)
+                    || *did == tcx.require_lang_item(lang_items::FnOnceTraitLangItem, None)
             }
             _ => false,
         }

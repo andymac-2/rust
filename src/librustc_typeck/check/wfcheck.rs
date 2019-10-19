@@ -48,7 +48,7 @@ impl<'tcx> CheckWfFcxBuilder<'tcx> {
                 // empty `param_env`.
                 check_false_global_bounds(&fcx, span, id);
             }
-            let wf_tys = f(&fcx, fcx.tcx.global_tcx());
+            let wf_tys = f(&fcx, fcx.tcx);
             fcx.select_all_obligations_or_error();
             fcx.regionck_item(id, span, &wf_tys);
         });
@@ -76,7 +76,7 @@ pub fn check_item_well_formed(tcx: TyCtxt<'_>, def_id: DefId) {
            item.hir_id,
            tcx.def_path_str(def_id));
 
-    match item.node {
+    match item.kind {
         // Right now we check that every default trait implementation
         // has an implementation of itself. Basically, a case like:
         //
@@ -94,20 +94,27 @@ pub fn check_item_well_formed(tcx: TyCtxt<'_>, def_id: DefId) {
         //
         // won't be allowed unless there's an *explicit* implementation of `Send`
         // for `T`
-        hir::ItemKind::Impl(_, polarity, defaultness, _, ref trait_ref, ref self_ty, _) => {
+        hir::ItemKind::Impl(_, _, defaultness, _, ref trait_ref, ref self_ty, _) => {
             let is_auto = tcx.impl_trait_ref(tcx.hir().local_def_id(item.hir_id))
-                                .map_or(false, |trait_ref| tcx.trait_is_auto(trait_ref.def_id));
+                .map_or(false, |trait_ref| tcx.trait_is_auto(trait_ref.def_id));
+            let polarity = tcx.impl_polarity(def_id);
             if let (hir::Defaultness::Default { .. }, true) = (defaultness, is_auto) {
                 tcx.sess.span_err(item.span, "impls of auto traits cannot be default");
             }
-            if polarity == hir::ImplPolarity::Positive {
-                check_impl(tcx, item, self_ty, trait_ref);
-            } else {
-                // FIXME(#27579): what amount of WF checking do we need for neg impls?
-                if trait_ref.is_some() && !is_auto {
-                    span_err!(tcx.sess, item.span, E0192,
-                              "negative impls are only allowed for \
-                               auto traits (e.g., `Send` and `Sync`)")
+            match polarity {
+                ty::ImplPolarity::Positive => {
+                    check_impl(tcx, item, self_ty, trait_ref);
+                }
+                ty::ImplPolarity::Negative => {
+                    // FIXME(#27579): what amount of WF checking do we need for neg impls?
+                    if trait_ref.is_some() && !is_auto {
+                        span_err!(tcx.sess, item.span, E0192,
+                                  "negative impls are only allowed for \
+                                   auto traits (e.g., `Send` and `Sync`)")
+                    }
+                }
+                ty::ImplPolarity::Reservation => {
+                    // FIXME: what amount of WF checking do we need for reservation impls?
                 }
             }
         }
@@ -121,7 +128,7 @@ pub fn check_item_well_formed(tcx: TyCtxt<'_>, def_id: DefId) {
             check_item_type(tcx, item.hir_id, ty.span, false);
         }
         hir::ItemKind::ForeignMod(ref module) => for it in module.items.iter() {
-            if let hir::ForeignItemKind::Static(ref ty, ..) = it.node {
+            if let hir::ForeignItemKind::Static(ref ty, ..) = it.kind {
                 check_item_type(tcx, it.hir_id, ty.span, true);
             }
         },
@@ -160,21 +167,57 @@ pub fn check_trait_item(tcx: TyCtxt<'_>, def_id: DefId) {
     let hir_id = tcx.hir().as_local_hir_id(def_id).unwrap();
     let trait_item = tcx.hir().expect_trait_item(hir_id);
 
-    let method_sig = match trait_item.node {
+    let method_sig = match trait_item.kind {
         hir::TraitItemKind::Method(ref sig, _) => Some(sig),
         _ => None
     };
     check_associated_item(tcx, trait_item.hir_id, trait_item.span, method_sig);
+
+    // Prohibits applying `#[track_caller]` to trait decls
+    for attr in &trait_item.attrs {
+        if attr.check_name(sym::track_caller) {
+            struct_span_err!(
+                tcx.sess,
+                attr.span,
+                E0738,
+                "`#[track_caller]` is not supported in trait declarations."
+            ).emit();
+        }
+    }
 }
 
 pub fn check_impl_item(tcx: TyCtxt<'_>, def_id: DefId) {
     let hir_id = tcx.hir().as_local_hir_id(def_id).unwrap();
     let impl_item = tcx.hir().expect_impl_item(hir_id);
 
-    let method_sig = match impl_item.node {
+    let method_sig = match impl_item.kind {
         hir::ImplItemKind::Method(ref sig, _) => Some(sig),
         _ => None
     };
+
+    // Prohibits applying `#[track_caller]` to trait impls
+    if method_sig.is_some() {
+        let track_caller_attr = impl_item.attrs.iter()
+            .find(|a| a.check_name(sym::track_caller));
+        if let Some(tc_attr) = track_caller_attr {
+            let parent_hir_id = tcx.hir().get_parent_item(hir_id);
+            let containing_item = tcx.hir().expect_item(parent_hir_id);
+            let containing_impl_is_for_trait = match &containing_item.kind {
+                hir::ItemKind::Impl(_, _, _, _, tr, _, _) => tr.is_some(),
+                _ => bug!("parent of an ImplItem must be an Impl"),
+            };
+
+            if containing_impl_is_for_trait {
+                struct_span_err!(
+                    tcx.sess,
+                    tc_attr.span,
+                    E0738,
+                    "`#[track_caller]` is not supported in traits yet."
+                ).emit();
+            }
+        }
+    }
+
     check_associated_item(tcx, impl_item.hir_id, impl_item.span, method_sig);
 }
 
@@ -287,12 +330,12 @@ fn check_type_defn<'tcx, F>(
                 let last = idx == variant.fields.len() - 1;
                 fcx.register_bound(
                     field.ty,
-                    fcx.tcx.require_lang_item(lang_items::SizedTraitLangItem),
+                    fcx.tcx.require_lang_item(lang_items::SizedTraitLangItem, None),
                     traits::ObligationCause::new(
                         field.span,
                         fcx.body_id,
                         traits::FieldSized {
-                            adt_kind: match item.node.adt_kind() {
+                            adt_kind: match item.kind.adt_kind() {
                                 Some(i) => i,
                                 None => bug!(),
                             },
@@ -359,14 +402,14 @@ fn check_item_type(
 ) {
     debug!("check_item_type: {:?}", item_id);
 
-    for_id(tcx, item_id, ty_span).with_fcx(|fcx, gcx| {
-        let ty = gcx.type_of(gcx.hir().local_def_id(item_id));
+    for_id(tcx, item_id, ty_span).with_fcx(|fcx, tcx| {
+        let ty = tcx.type_of(tcx.hir().local_def_id(item_id));
         let item_ty = fcx.normalize_associated_types_in(ty_span, &ty);
 
         let mut forbid_unsized = true;
         if allow_foreign_ty {
             let tail = fcx.tcx.struct_tail_erasing_lifetimes(item_ty, fcx.param_env);
-            if let ty::Foreign(_) = tail.sty {
+            if let ty::Foreign(_) = tail.kind {
                 forbid_unsized = false;
             }
         }
@@ -375,7 +418,7 @@ fn check_item_type(
         if forbid_unsized {
             fcx.register_bound(
                 item_ty,
-                fcx.tcx.require_lang_item(lang_items::SizedTraitLangItem),
+                fcx.tcx.require_lang_item(lang_items::SizedTraitLangItem, None),
                 traits::ObligationCause::new(ty_span, fcx.body_id, traits::MiscObligation),
             );
         }
@@ -398,16 +441,19 @@ fn check_impl<'tcx>(
 
         match *ast_trait_ref {
             Some(ref ast_trait_ref) => {
+                // `#[rustc_reservation_impl]` impls are not real impls and
+                // therefore don't need to be WF (the trait's `Self: Trait` predicate
+                // won't hold).
                 let trait_ref = fcx.tcx.impl_trait_ref(item_def_id).unwrap();
                 let trait_ref =
                     fcx.normalize_associated_types_in(
                         ast_trait_ref.path.span, &trait_ref);
                 let obligations =
                     ty::wf::trait_obligations(fcx,
-                                                fcx.param_env,
-                                                fcx.body_id,
-                                                &trait_ref,
-                                                ast_trait_ref.path.span);
+                                              fcx.param_env,
+                                              fcx.body_id,
+                                              &trait_ref,
+                                              ast_trait_ref.path.span);
                 for obligation in obligations {
                     fcx.register_predicate(obligation);
                 }
@@ -506,12 +552,12 @@ fn check_where_clauses<'tcx, 'fcx>(
     });
 
     // Now we build the substituted predicates.
-    let default_obligations = predicates.predicates.iter().flat_map(|&(pred, _)| {
+    let default_obligations = predicates.predicates.iter().flat_map(|&(pred, sp)| {
         #[derive(Default)]
         struct CountParams { params: FxHashSet<u32> }
         impl<'tcx> ty::fold::TypeVisitor<'tcx> for CountParams {
             fn visit_ty(&mut self, t: Ty<'tcx>) -> bool {
-                if let ty::Param(param) = t.sty {
+                if let ty::Param(param) = t.kind {
                     self.params.insert(param.index);
                 }
                 t.super_visit_with(self)
@@ -539,9 +585,9 @@ fn check_where_clauses<'tcx, 'fcx>(
             // Avoid duplication of predicates that contain no parameters, for example.
             None
         } else {
-            Some(substituted_pred)
+            Some((substituted_pred, sp))
         }
-    }).map(|pred| {
+    }).map(|(pred, sp)| {
         // Convert each of those into an obligation. So if you have
         // something like `struct Foo<T: Copy = String>`, we would
         // take that predicate `T: Copy`, substitute to `String: Copy`
@@ -551,8 +597,8 @@ fn check_where_clauses<'tcx, 'fcx>(
         // Note the subtle difference from how we handle `predicates`
         // below: there, we are not trying to prove those predicates
         // to be *true* but merely *well-formed*.
-        let pred = fcx.normalize_associated_types_in(span, &pred);
-        let cause = traits::ObligationCause::new(span, fcx.body_id, traits::ItemObligation(def_id));
+        let pred = fcx.normalize_associated_types_in(sp, &pred);
+        let cause = traits::ObligationCause::new(sp, fcx.body_id, traits::ItemObligation(def_id));
         traits::Obligation::new(cause, fcx.param_env, pred)
     });
 
@@ -596,7 +642,7 @@ fn check_fn_or_method<'fcx, 'tcx>(
     }
     implied_bounds.extend(sig.inputs());
 
-    fcx.register_wf_obligation(sig.output(), span, ObligationCauseCode::MiscObligation);
+    fcx.register_wf_obligation(sig.output(), span, ObligationCauseCode::ReturnType);
 
     // FIXME(#25759) return types should not be implied bounds
     implied_bounds.push(sig.output());
@@ -635,7 +681,7 @@ fn check_opaque_types<'fcx, 'tcx>(
     ty.fold_with(&mut ty::fold::BottomUpFolder {
         tcx: fcx.tcx,
         ty_op: |ty| {
-            if let ty::Opaque(def_id, substs) = ty.sty {
+            if let ty::Opaque(def_id, substs) = ty.kind {
                 trace!("check_opaque_types: opaque_ty, {:?}, {:?}", def_id, substs);
                 let generics = tcx.generics_of(def_id);
                 // Only check named `impl Trait` types defined in this crate.
@@ -646,7 +692,7 @@ fn check_opaque_types<'fcx, 'tcx>(
                         let mut seen: FxHashMap<_, Vec<_>> = FxHashMap::default();
                         for (subst, param) in substs.iter().zip(&generics.params) {
                             match subst.unpack() {
-                                ty::subst::UnpackedKind::Type(ty) => match ty.sty {
+                                ty::subst::GenericArgKind::Type(ty) => match ty.kind {
                                     ty::Param(..) => {}
                                     // Prevent `fn foo() -> Foo<u32>` from being defining.
                                     _ => {
@@ -668,7 +714,7 @@ fn check_opaque_types<'fcx, 'tcx>(
                                     }
                                 }
 
-                                ty::subst::UnpackedKind::Lifetime(region) => {
+                                ty::subst::GenericArgKind::Lifetime(region) => {
                                     let param_span = tcx.def_span(param.def_id);
                                     if let ty::ReStatic = region {
                                         tcx
@@ -690,7 +736,7 @@ fn check_opaque_types<'fcx, 'tcx>(
                                     }
                                 }
 
-                                ty::subst::UnpackedKind::Const(ct) => match ct.val {
+                                ty::subst::GenericArgKind::Const(ct) => match ct.val {
                                     ConstValue::Param(_) => {}
                                     _ => {
                                         tcx.sess
@@ -745,7 +791,7 @@ fn check_opaque_types<'fcx, 'tcx>(
                         "check_opaque_types: may define, predicates={:#?}",
                         predicates,
                     );
-                    for &(pred, _) in predicates.predicates.iter() {
+                    for &(pred, _) in predicates.predicates {
                         let substituted_pred = pred.subst(fcx.tcx, substs);
                         // Avoid duplication of predicates that contain no parameters, for example.
                         if !predicates.predicates.iter().any(|&(p, _)| p == substituted_pred) {
@@ -762,19 +808,19 @@ fn check_opaque_types<'fcx, 'tcx>(
     substituted_predicates
 }
 
+const HELP_FOR_SELF_TYPE: &str =
+    "consider changing to `self`, `&self`, `&mut self`, `self: Box<Self>`, \
+     `self: Rc<Self>`, `self: Arc<Self>`, or `self: Pin<P>` (where P is one \
+     of the previous types except `Self`)";
+
 fn check_method_receiver<'fcx, 'tcx>(
     fcx: &FnCtxt<'fcx, 'tcx>,
     method_sig: &hir::MethodSig,
     method: &ty::AssocItem,
     self_ty: Ty<'tcx>,
 ) {
-    const HELP_FOR_SELF_TYPE: &str =
-        "consider changing to `self`, `&self`, `&mut self`, `self: Box<Self>`, \
-         `self: Rc<Self>`, `self: Arc<Self>`, or `self: Pin<P>` (where P is one \
-         of the previous types except `Self`)";
     // Check that the method has a valid receiver type, given the type `Self`.
-    debug!("check_method_receiver({:?}, self_ty={:?})",
-           method, self_ty);
+    debug!("check_method_receiver({:?}, self_ty={:?})", method, self_ty);
 
     if !method.method_has_self_argument {
         return;
@@ -805,12 +851,7 @@ fn check_method_receiver<'fcx, 'tcx>(
     if fcx.tcx.features().arbitrary_self_types {
         if !receiver_is_valid(fcx, span, receiver_ty, self_ty, true) {
             // Report error; `arbitrary_self_types` was enabled.
-            fcx.tcx.sess.diagnostic().mut_span_err(
-                span, &format!("invalid method receiver type: {:?}", receiver_ty)
-            ).note("type of `self` must be `Self` or a type that dereferences to it")
-            .help(HELP_FOR_SELF_TYPE)
-            .code(DiagnosticId::Error("E0307".into()))
-            .emit();
+            e0307(fcx, span, receiver_ty);
         }
     } else {
         if !receiver_is_valid(fcx, span, receiver_ty, self_ty, false) {
@@ -830,15 +871,20 @@ fn check_method_receiver<'fcx, 'tcx>(
                 .emit();
             } else {
                 // Report error; would not have worked with `arbitrary_self_types`.
-                fcx.tcx.sess.diagnostic().mut_span_err(
-                    span, &format!("invalid method receiver type: {:?}", receiver_ty)
-                ).note("type must be `Self` or a type that dereferences to it")
-                .help(HELP_FOR_SELF_TYPE)
-                .code(DiagnosticId::Error("E0307".into()))
-                .emit();
+                e0307(fcx, span, receiver_ty);
             }
         }
     }
+}
+
+fn e0307(fcx: &FnCtxt<'fcx, 'tcx>, span: Span, receiver_ty: Ty<'_>) {
+    fcx.tcx.sess.diagnostic().struct_span_err(
+        span,
+        &format!("invalid `self` parameter type: {:?}", receiver_ty)
+    ).note("type of `self` must be `Self` or a type that dereferences to it")
+    .help(HELP_FOR_SELF_TYPE)
+    .code(DiagnosticId::Error("E0307".into()))
+    .emit();
 }
 
 /// Returns whether `receiver_ty` would be considered a valid receiver type for `self_ty`. If
@@ -965,7 +1011,7 @@ fn check_variances_for_type_defn<'tcx>(
 
     identify_constrained_generic_params(
         tcx,
-        &ty_predicates,
+        ty_predicates,
         None,
         &mut constrained_parameters,
     );
@@ -989,11 +1035,16 @@ fn report_bivariance(tcx: TyCtxt<'_>, span: Span, param_name: ast::Name) {
 
     let suggested_marker_id = tcx.lang_items().phantom_data();
     // Help is available only in presence of lang items.
-    if let Some(def_id) = suggested_marker_id {
-        err.help(&format!("consider removing `{}` or using a marker such as `{}`",
-                          param_name,
-                          tcx.def_path_str(def_id)));
-    }
+    let msg = if let Some(def_id) = suggested_marker_id {
+        format!(
+            "consider removing `{}`, referring to it in a field, or using a marker such as `{}`",
+            param_name,
+            tcx.def_path_str(def_id),
+        )
+    } else {
+        format!( "consider removing `{}` or referring to it in a field", param_name)
+    };
+    err.help(&msg);
     err.emit();
 }
 

@@ -10,7 +10,6 @@
 #![feature(core_intrinsics)]
 #![feature(never_type)]
 #![feature(nll)]
-#![feature(rustc_diagnostic_macros)]
 #![feature(in_band_lifetimes)]
 
 #![recursion_limit="256"]
@@ -19,6 +18,7 @@
 extern crate rustc;
 
 use rustc::ty::TyCtxt;
+use rustc::ty::query::Providers;
 use rustc::hir::def_id::LOCAL_CRATE;
 use syntax::symbol::sym;
 
@@ -37,4 +37,8 @@ pub fn check_for_rustc_errors_attr(tcx: TyCtxt<'_>) {
             tcx.sess.span_fatal(tcx.def_span(def_id), "compilation successful");
         }
     }
+}
+
+pub fn provide(providers: &mut Providers<'_>) {
+    crate::symbol_names::provide(providers);
 }

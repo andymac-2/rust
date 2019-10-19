@@ -94,7 +94,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for TyTyKind {
     }
 
     fn check_ty(&mut self, cx: &LateContext<'_, '_>, ty: &'tcx Ty) {
-        match &ty.node {
+        match &ty.kind {
             TyKind::Path(qpath) => {
                 if let QPath::Resolved(_, path) = qpath {
                     if let Some(last) = path.segments.iter().last() {
@@ -159,29 +159,23 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for TyTyKind {
 }
 
 fn lint_ty_kind_usage(cx: &LateContext<'_, '_>, segment: &PathSegment) -> bool {
-    if segment.ident.name == sym::TyKind {
-        if let Some(res) = segment.res {
-            if let Some(did) = res.opt_def_id() {
-                return cx.match_def_path(did, TYKIND_PATH);
-            }
+    if let Some(res) = segment.res {
+        if let Some(did) = res.opt_def_id() {
+            return cx.tcx.is_diagnostic_item(sym::TyKind, did);
         }
     }
 
     false
 }
 
-const TYKIND_PATH: &[Symbol] = &[sym::rustc, sym::ty, sym::sty, sym::TyKind];
-const TY_PATH: &[Symbol] = &[sym::rustc, sym::ty, sym::Ty];
-const TYCTXT_PATH: &[Symbol] = &[sym::rustc, sym::ty, sym::context, sym::TyCtxt];
-
 fn is_ty_or_ty_ctxt(cx: &LateContext<'_, '_>, ty: &Ty) -> Option<String> {
-    match &ty.node {
+    match &ty.kind {
         TyKind::Path(qpath) => {
             if let QPath::Resolved(_, path) = qpath {
                 let did = path.res.opt_def_id()?;
-                if cx.match_def_path(did, TY_PATH) {
+                if cx.tcx.is_diagnostic_item(sym::Ty, did) {
                     return Some(format!("Ty{}", gen_args(path.segments.last().unwrap())));
-                } else if cx.match_def_path(did, TYCTXT_PATH) {
+                } else if cx.tcx.is_diagnostic_item(sym::TyCtxt, did) {
                     return Some(format!("TyCtxt{}", gen_args(path.segments.last().unwrap())));
                 }
             }
@@ -224,7 +218,7 @@ declare_lint_pass!(LintPassImpl => [LINT_PASS_IMPL_WITHOUT_MACRO]);
 
 impl EarlyLintPass for LintPassImpl {
     fn check_item(&mut self, cx: &EarlyContext<'_>, item: &Item) {
-        if let ItemKind::Impl(_, _, _, _, Some(lint_pass), _, _) = &item.node {
+        if let ItemKind::Impl(_, _, _, _, Some(lint_pass), _, _) = &item.kind {
             if let Some(last) = lint_pass.path.segments.last() {
                 if last.ident.name == sym::LintPass {
                     let expn_data = lint_pass.path.span.ctxt().outer_expn_data();

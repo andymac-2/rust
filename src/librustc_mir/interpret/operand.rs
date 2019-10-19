@@ -1,11 +1,11 @@
 //! Functions concerning immediate values and operands, and reading from operands.
 //! All high-level functions to read from memory work on operands as sources.
 
-use std::convert::TryInto;
+use std::convert::{TryInto, TryFrom};
 
 use rustc::{mir, ty};
 use rustc::ty::layout::{
-    self, Size, LayoutOf, TyLayout, HasDataLayout, IntegerExt, VariantIdx,
+    self, Size, LayoutOf, TyLayout, HasDataLayout, IntegerExt, PrimitiveExt, VariantIdx,
 };
 
 use rustc::mir::interpret::{
@@ -335,6 +335,17 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         }
     }
 
+    /// Read vector length and element type
+    pub fn read_vector_ty(
+        &self, op: OpTy<'tcx, M::PointerTag>
+    ) -> (u64, &rustc::ty::TyS<'tcx>) {
+        if let layout::Abi::Vector { .. } = op.layout.abi {
+            (op.layout.ty.simd_size(*self.tcx) as _, op.layout.ty.simd_type(*self.tcx))
+        } else {
+            bug!("Type `{}` is not a SIMD vector type", op.layout.ty)
+        }
+    }
+
     /// Read a scalar from a place
     pub fn read_scalar(
         &self,
@@ -447,7 +458,7 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             // Do not read from ZST, they might not be initialized
             Operand::Immediate(Scalar::zst().into())
         } else {
-            frame.locals[local].access()?
+            M::access_local(&self, frame, local)?
         };
         Ok(OpTy { op, layout })
     }
@@ -470,41 +481,40 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
 
     // Evaluate a place with the goal of reading from it.  This lets us sometimes
     // avoid allocations.
-    pub(super) fn eval_place_to_op(
+    pub fn eval_place_to_op(
         &self,
-        mir_place: &mir::Place<'tcx>,
+        place: &mir::Place<'tcx>,
         layout: Option<TyLayout<'tcx>>,
     ) -> InterpResult<'tcx, OpTy<'tcx, M::PointerTag>> {
         use rustc::mir::PlaceBase;
 
-        mir_place.iterate(|place_base, place_projection| {
-            let mut op = match place_base {
-                PlaceBase::Local(mir::RETURN_PLACE) =>
-                    throw_unsup!(ReadFromReturnPointer),
-                PlaceBase::Local(local) => {
-                    // Do not use the layout passed in as argument if the base we are looking at
-                    // here is not the entire place.
-                    // FIXME use place_projection.is_empty() when is available
-                    let layout = if mir_place.projection.is_none() {
-                        layout
-                    } else {
-                        None
-                    };
+        let base_op = match &place.base {
+            PlaceBase::Local(mir::RETURN_PLACE) =>
+                throw_unsup!(ReadFromReturnPointer),
+            PlaceBase::Local(local) => {
+                // Do not use the layout passed in as argument if the base we are looking at
+                // here is not the entire place.
+                // FIXME use place_projection.is_empty() when is available
+                let layout = if place.projection.is_empty() {
+                    layout
+                } else {
+                    None
+                };
 
-                    self.access_local(self.frame(), *local, layout)?
-                }
-                PlaceBase::Static(place_static) => {
-                    self.eval_static_to_mplace(place_static)?.into()
-                }
-            };
-
-            for proj in place_projection {
-                op = self.operand_projection(op, &proj.elem)?
+                self.access_local(self.frame(), *local, layout)?
             }
+            PlaceBase::Static(place_static) => {
+                self.eval_static_to_mplace(&place_static)?.into()
+            }
+        };
 
-            trace!("eval_place_to_op: got {:?}", *op);
-            Ok(op)
-        })
+        let op = place.projection.iter().try_fold(
+            base_op,
+            |op, elem| self.operand_projection(op, elem)
+        )?;
+
+        trace!("eval_place_to_op: got {:?}", *op);
+        Ok(op)
     }
 
     /// Evaluate the operand, returning a place where you can then find the data.
@@ -610,15 +620,20 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     ) -> InterpResult<'tcx, (u128, VariantIdx)> {
         trace!("read_discriminant_value {:#?}", rval.layout);
 
-        let (discr_kind, discr_index) = match rval.layout.variants {
+        let (discr_layout, discr_kind, discr_index) = match rval.layout.variants {
             layout::Variants::Single { index } => {
                 let discr_val = rval.layout.ty.discriminant_for_variant(*self.tcx, index).map_or(
                     index.as_u32() as u128,
                     |discr| discr.val);
                 return Ok((discr_val, index));
             }
-            layout::Variants::Multiple { ref discr_kind, discr_index, .. } =>
-                (discr_kind, discr_index),
+            layout::Variants::Multiple {
+                discr: ref discr_layout,
+                ref discr_kind,
+                discr_index,
+                ..
+            } =>
+                (discr_layout, discr_kind, discr_index),
         };
 
         // read raw discriminant value
@@ -635,7 +650,7 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                     .map_err(|_| err_unsup!(InvalidDiscriminant(raw_discr.erase_tag())))?;
                 let real_discr = if discr_val.layout.ty.is_signed() {
                     // going from layout tag type to typeck discriminant type
-                    // requires first sign extending with the layout discriminant
+                    // requires first sign extending with the discriminant layout
                     let sexted = sign_extend(bits_discr, discr_val.layout.size) as i128;
                     // and then zeroing with the typeck discriminant type
                     let discr_ty = rval.layout.ty
@@ -649,14 +664,18 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                     bits_discr
                 };
                 // Make sure we catch invalid discriminants
-                let index = match &rval.layout.ty.sty {
+                let index = match rval.layout.ty.kind {
                     ty::Adt(adt, _) => adt
                         .discriminants(self.tcx.tcx)
                         .find(|(_, var)| var.val == real_discr),
-                    ty::Generator(def_id, substs, _) => substs
-                        .discriminants(*def_id, self.tcx.tcx)
-                        .find(|(_, var)| var.val == real_discr),
+                    ty::Generator(def_id, substs, _) => {
+                        let substs = substs.as_generator();
+                        substs
+                            .discriminants(def_id, self.tcx.tcx)
+                            .find(|(_, var)| var.val == real_discr)
+                    }
                     _ => bug!("tagged layout for non-adt non-generator"),
+
                 }.ok_or_else(
                     || err_unsup!(InvalidDiscriminant(raw_discr.erase_tag()))
                 )?;
@@ -667,8 +686,8 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 ref niche_variants,
                 niche_start,
             } => {
-                let variants_start = niche_variants.start().as_u32() as u128;
-                let variants_end = niche_variants.end().as_u32() as u128;
+                let variants_start = niche_variants.start().as_u32();
+                let variants_end = niche_variants.end().as_u32();
                 let raw_discr = raw_discr.not_undef().map_err(|_| {
                     err_unsup!(InvalidDiscriminant(ScalarMaybeUndef::Undef))
                 })?;
@@ -683,18 +702,34 @@ impl<'mir, 'tcx, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                         (dataful_variant.as_u32() as u128, dataful_variant)
                     },
                     Ok(raw_discr) => {
-                        let adjusted_discr = raw_discr.wrapping_sub(niche_start)
-                            .wrapping_add(variants_start);
-                        if variants_start <= adjusted_discr && adjusted_discr <= variants_end {
-                            let index = adjusted_discr as usize;
-                            assert_eq!(index as u128, adjusted_discr);
-                            assert!(index < rval.layout.ty
+                        // We need to use machine arithmetic to get the relative variant idx:
+                        // variant_index_relative = discr_val - niche_start_val
+                        let discr_layout = self.layout_of(discr_layout.value.to_int_ty(*self.tcx))?;
+                        let discr_val = ImmTy::from_uint(raw_discr, discr_layout);
+                        let niche_start_val = ImmTy::from_uint(niche_start, discr_layout);
+                        let variant_index_relative_val = self.binary_op(
+                            mir::BinOp::Sub,
+                            discr_val,
+                            niche_start_val,
+                        )?;
+                        let variant_index_relative = variant_index_relative_val
+                            .to_scalar()?
+                            .assert_bits(discr_val.layout.size);
+                        // Check if this is in the range that indicates an actual discriminant.
+                        if variant_index_relative <= u128::from(variants_end - variants_start) {
+                            let variant_index_relative = u32::try_from(variant_index_relative)
+                                .expect("we checked that this fits into a u32");
+                            // Then computing the absolute variant idx should not overflow any more.
+                            let variant_index = variants_start
+                                .checked_add(variant_index_relative)
+                                .expect("oveflow computing absolute variant idx");
+                            assert!((variant_index as usize) < rval.layout.ty
                                 .ty_adt_def()
                                 .expect("tagged layout for non adt")
                                 .variants.len());
-                            (adjusted_discr, VariantIdx::from_usize(index))
+                            (u128::from(variant_index), VariantIdx::from_u32(variant_index))
                         } else {
-                            (dataful_variant.as_u32() as u128, dataful_variant)
+                            (u128::from(dataful_variant.as_u32()), dataful_variant)
                         }
                     },
                 }

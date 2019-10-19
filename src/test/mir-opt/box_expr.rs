@@ -1,4 +1,4 @@
-// ignore-wasm32-bare compiled with panic=abort by default
+// ignore-emscripten compiled with panic=abort by default
 
 #![feature(box_syntax)]
 
@@ -57,25 +57,18 @@ impl Drop for S {
 //     }
 //
 //     bb5: {
-//         drop(_4) -> [return: bb8, unwind: bb6];
-//     }
-//
-//     bb6 (cleanup): {
-//         drop(_1) -> bb1;
-//     }
-//
-//     bb7 (cleanup): {
-//         drop(_4) -> bb6;
-//     }
-//
-//     bb8: {
 //         StorageDead(_4);
 //         StorageDead(_3);
 //         _0 = ();
-//         drop(_1) -> bb9;
+//         drop(_1) -> bb8;
 //     }
-//
-//     bb9: {
+//     bb6 (cleanup): {
+//         drop(_1) -> bb1;
+//     }
+//     bb7 (cleanup): {
+//         drop(_4) -> bb6;
+//     }
+//     bb8: {
 //         StorageDead(_1);
 //         return;
 //     }

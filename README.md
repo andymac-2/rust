@@ -26,12 +26,14 @@ or reading the [rustc guide][rustcguidebuild].
 ### Building on *nix
 1. Make sure you have installed the dependencies:
 
-   * `g++` 4.7 or later or `clang++` 3.x or later
+   * `g++` 5.1 or later or `clang++` 3.5 or later
    * `python` 2.7 (but not 3.x)
    * GNU `make` 3.81 or later
    * `cmake` 3.4.3 or later
    * `curl`
    * `git`
+   * `ssl` which comes in `libssl-dev` or `openssl-devel`
+   * `pkg-config` if you are compiling on Linux and targeting Linux
 
 2. Clone the [source] with `git`:
 
@@ -55,6 +57,8 @@ or reading the [rustc guide][rustcguidebuild].
     It is recommended that if you plan to use the Rust build system to create
     an installation (using `./x.py install`) that you set the `prefix` value
     in the `[install]` section to a directory that you have write permissions.
+
+    Create install directory if you are not installing in default directory
 
 4. Build and install:
 
@@ -148,6 +152,17 @@ by manually calling the appropriate vcvars file before running the bootstrap.
 > python x.py build
 ```
 
+### Building rustc with older host toolchains
+It is still possible to build Rust with the older toolchain versions listed below, but only if the
+LLVM_TEMPORARILY_ALLOW_OLD_TOOLCHAIN option is set to true in the config.toml file.
+
+* Clang 3.1
+* Apple Clang 3.1
+* GCC 4.8
+* Visual Studio 2015 (Update 3)
+
+Toolchain versions older than what is listed above cannot be used to build rustc.
+
 #### Specifying an ABI
 
 Each specific ABI can also be used from either environment (for example, using
@@ -229,19 +244,17 @@ The Rust community congregates in a few places:
 
 To contribute to Rust, please see [CONTRIBUTING](CONTRIBUTING.md).
 
-Rust has an [IRC] culture and most real-time collaboration happens in a
-variety of channels on Mozilla's IRC network, irc.mozilla.org. The
-most popular channel is [#rust], a venue for general discussion about
-Rust. And a good place to ask for help would be [#rust-beginners].
+Most real-time collaboration happens in a variety of channels on the
+[Rust Discord server][rust-discord], with channels dedicated for getting help,
+community, documentation, and all major contribution areas in the Rust ecosystem.
+A good place to ask for help would be the #help channel.
 
 The [rustc guide] might be a good place to start if you want to find out how
 various parts of the compiler work.
 
 Also, you may find the [rustdocs for the compiler itself][rustdocs] useful.
 
-[IRC]: https://en.wikipedia.org/wiki/Internet_Relay_Chat
-[#rust]: irc://irc.mozilla.org/rust
-[#rust-beginners]: irc://irc.mozilla.org/rust-beginners
+[rust-discord]: https://discord.gg/rust-lang
 [rustc guide]: https://rust-lang.github.io/rustc-guide/about-this-guide.html
 [rustdocs]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc/
 

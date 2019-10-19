@@ -44,7 +44,7 @@ impl<'a, 'tcx> FindLocalByTypeVisitor<'a, 'tcx> {
             Some(ty) => {
                 let ty = self.infcx.resolve_vars_if_possible(&ty);
                 if ty.walk().any(|inner_ty| {
-                    inner_ty == self.target_ty || match (&inner_ty.sty, &self.target_ty.sty) {
+                    inner_ty == self.target_ty || match (&inner_ty.kind, &self.target_ty.kind) {
                         (&Infer(TyVar(a_vid)), &Infer(TyVar(b_vid))) => {
                             self.infcx
                                 .type_variables
@@ -78,12 +78,12 @@ impl<'a, 'tcx> Visitor<'tcx> for FindLocalByTypeVisitor<'a, 'tcx> {
     }
 
     fn visit_body(&mut self, body: &'tcx Body) {
-        for argument in &body.arguments {
+        for param in &body.params {
             if let (None, Some(ty)) = (
                 self.found_arg_pattern,
-                self.node_matches_type(argument.hir_id),
+                self.node_matches_type(param.hir_id),
             ) {
-                self.found_arg_pattern = Some(&*argument.pat);
+                self.found_arg_pattern = Some(&*param.pat);
                 self.found_ty = Some(ty);
             }
         }
@@ -92,10 +92,10 @@ impl<'a, 'tcx> Visitor<'tcx> for FindLocalByTypeVisitor<'a, 'tcx> {
 
     fn visit_expr(&mut self, expr: &'tcx Expr) {
         if let (ExprKind::Closure(_, _fn_decl, _id, _sp, _), Some(_)) = (
-            &expr.node,
+            &expr.kind,
             self.node_matches_type(expr.hir_id),
         ) {
-            self.found_closure = Some(&expr.node);
+            self.found_closure = Some(&expr.kind);
         }
         intravisit::walk_expr(self, expr);
     }
@@ -114,7 +114,7 @@ fn closure_return_type_suggestion(
         FunctionRetTy::DefaultReturn(_) => ("-> ", " "),
         _ => ("", ""),
     };
-    let suggestion = match body.value.node {
+    let suggestion = match body.value.kind {
         ExprKind::Block(..) => {
             vec![(output.span(), format!("{}{}{}", arrow, ret, post))]
         }
@@ -150,12 +150,12 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
         &self,
         ty: Ty<'tcx>,
         highlight: Option<ty::print::RegionHighlightMode>,
-    ) -> String {
-        if let ty::Infer(ty::TyVar(ty_vid)) = ty.sty {
+    ) -> (String, Option<Span>) {
+        if let ty::Infer(ty::TyVar(ty_vid)) = ty.kind {
             let ty_vars = self.type_variables.borrow();
-            if let TypeVariableOriginKind::TypeParameterDefinition(name) =
-                ty_vars.var_origin(ty_vid).kind {
-                return name.to_string();
+            let var_origin = ty_vars.var_origin(ty_vid);
+            if let TypeVariableOriginKind::TypeParameterDefinition(name) = var_origin.kind {
+                return (name.to_string(), Some(var_origin.span));
             }
         }
 
@@ -165,7 +165,7 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
             printer.region_highlight_mode = highlight;
         }
         let _ = ty.print(printer);
-        s
+        (s, None)
     }
 
     pub fn need_type_info_err(
@@ -175,7 +175,7 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
         ty: Ty<'tcx>,
     ) -> DiagnosticBuilder<'tcx> {
         let ty = self.resolve_vars_if_possible(&ty);
-        let name = self.extract_type_name(&ty, None);
+        let (name, name_sp) = self.extract_type_name(&ty, None);
 
         let mut local_visitor = FindLocalByTypeVisitor::new(&self, ty, &self.tcx.hir());
         let ty_to_string = |ty: Ty<'tcx>| -> String {
@@ -200,6 +200,14 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
         }
         let err_span = if let Some(pattern) = local_visitor.found_arg_pattern {
             pattern.span
+        } else if let Some(span) = name_sp {
+            // `span` here lets us point at `sum` instead of the entire right hand side expr:
+            // error[E0282]: type annotations needed
+            //  --> file2.rs:3:15
+            //   |
+            // 3 |     let _ = x.sum() as f64;
+            //   |               ^^^ cannot infer type for `S`
+            span
         } else {
             span
         };
@@ -211,8 +219,8 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
         };
 
         let ty_msg = match local_visitor.found_ty {
-            Some(ty::TyS { sty: ty::Closure(def_id, substs), .. }) => {
-                let fn_sig = substs.closure_sig(*def_id, self.tcx);
+            Some(ty::TyS { kind: ty::Closure(def_id, substs), .. }) => {
+                let fn_sig = substs.as_closure().sig(*def_id, self.tcx);
                 let args = closure_args(&fn_sig);
                 let ret = fn_sig.output().skip_binder().to_string();
                 format!(" for the closure `fn({}) -> {}`", args, ret)
@@ -246,8 +254,8 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
         );
 
         let suffix = match local_visitor.found_ty {
-            Some(ty::TyS { sty: ty::Closure(def_id, substs), .. }) => {
-                let fn_sig = substs.closure_sig(*def_id, self.tcx);
+            Some(ty::TyS { kind: ty::Closure(def_id, substs), .. }) => {
+                let fn_sig = substs.as_closure().sig(*def_id, self.tcx);
                 let ret = fn_sig.output().skip_binder().to_string();
 
                 if let Some(ExprKind::Closure(_, decl, body_id, ..)) = local_visitor.found_closure {
@@ -325,6 +333,23 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
             };
             err.span_label(pattern.span, msg);
         }
+        // Instead of the following:
+        // error[E0282]: type annotations needed
+        //  --> file2.rs:3:15
+        //   |
+        // 3 |     let _ = x.sum() as f64;
+        //   |             --^^^--------- cannot infer type for `S`
+        //   |
+        //   = note: type must be known at this point
+        // We want:
+        // error[E0282]: type annotations needed
+        //  --> file2.rs:3:15
+        //   |
+        // 3 |     let _ = x.sum() as f64;
+        //   |               ^^^ cannot infer type for `S`
+        //   |
+        //   = note: type must be known at this point
+        let span = name_sp.unwrap_or(span);
         if !err.span.span_labels().iter().any(|span_label| {
                 span_label.label.is_some() && span_label.span == span
             }) && local_visitor.found_arg_pattern.is_none()
@@ -342,7 +367,7 @@ impl<'a, 'tcx> InferCtxt<'a, 'tcx> {
         ty: Ty<'tcx>,
     ) -> DiagnosticBuilder<'tcx> {
         let ty = self.resolve_vars_if_possible(&ty);
-        let name = self.extract_type_name(&ty, None);
+        let name = self.extract_type_name(&ty, None).0;
         let mut err = struct_span_err!(
             self.tcx.sess, span, E0698, "type inside {} must be known in this context", kind,
         );

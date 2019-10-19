@@ -81,26 +81,29 @@ impl Step for Llvm {
             (info, "src/llvm-project/llvm", builder.llvm_out(target), dir.join("bin"))
         };
 
-        if !llvm_info.is_git() {
-            println!(
-                "git could not determine the LLVM submodule commit hash. \
-                Assuming that an LLVM build is necessary.",
-            );
-        }
-
         let build_llvm_config = llvm_config_ret_dir
             .join(exe("llvm-config", &*builder.config.build));
         let done_stamp = out_dir.join("llvm-finished-building");
 
-        if let Some(llvm_commit) = llvm_info.sha() {
-            if done_stamp.exists() {
+        if done_stamp.exists() {
+            if let Some(llvm_commit) = llvm_info.sha() {
                 let done_contents = t!(fs::read(&done_stamp));
 
                 // If LLVM was already built previously and the submodule's commit didn't change
                 // from the previous build, then no action is required.
                 if done_contents == llvm_commit.as_bytes() {
-                    return build_llvm_config
+                    return build_llvm_config;
                 }
+            } else {
+                builder.info(
+                    "Could not determine the LLVM submodule commit hash. \
+                     Assuming that an LLVM rebuild is not necessary.",
+                );
+                builder.info(&format!(
+                    "To force LLVM to rebuild, remove the file `{}`",
+                    done_stamp.display()
+                ));
+                return build_llvm_config;
             }
         }
 
@@ -154,6 +157,7 @@ impl Step for Llvm {
            .define("WITH_POLLY", "OFF")
            .define("LLVM_ENABLE_TERMINFO", "OFF")
            .define("LLVM_ENABLE_LIBEDIT", "OFF")
+           .define("LLVM_ENABLE_BINDINGS", "OFF")
            .define("LLVM_ENABLE_Z3_SOLVER", "OFF")
            .define("LLVM_PARALLEL_COMPILE_JOBS", builder.jobs().to_string())
            .define("LLVM_TARGET_ARCH", target.split('-').next().unwrap())
@@ -165,15 +169,6 @@ impl Step for Llvm {
                cfg.define("LLVM_ENABLE_LLD", "ON");
             }
         }
-
-        // By default, LLVM will automatically find OCaml and, if it finds it,
-        // install the LLVM bindings in LLVM_OCAML_INSTALL_PATH, which defaults
-        // to /usr/bin/ocaml.
-        // This causes problem for non-root builds of Rust. Side-step the issue
-        // by setting LLVM_OCAML_INSTALL_PATH to a relative path, so it installs
-        // in the prefix.
-        cfg.define("LLVM_OCAML_INSTALL_PATH",
-            env::var_os("LLVM_OCAML_INSTALL_PATH").unwrap_or_else(|| "usr/lib/ocaml".into()));
 
         let want_lldb = builder.config.lldb_enabled && !self.emscripten;
 
@@ -303,9 +298,7 @@ impl Step for Llvm {
 
         cfg.build();
 
-        if let Some(llvm_commit) = llvm_info.sha() {
-            t!(fs::write(&done_stamp, llvm_commit));
-        }
+        t!(fs::write(&done_stamp, llvm_info.sha().unwrap_or("")));
 
         build_llvm_config
     }

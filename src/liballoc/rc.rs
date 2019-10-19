@@ -567,7 +567,7 @@ impl<T: ?Sized> Rc<T> {
     ///     let x = Rc::from_raw(x_ptr);
     ///     assert_eq!(&*x, "hello");
     ///
-    ///     // Further calls to `Rc::from_raw(x_ptr)` would be memory unsafe.
+    ///     // Further calls to `Rc::from_raw(x_ptr)` would be memory-unsafe.
     /// }
     ///
     /// // The memory was freed when `x` went out of scope above, so `x_ptr` is now dangling!
@@ -773,7 +773,7 @@ impl<T: Clone> Rc<T> {
     /// referred to as clone-on-write.
     ///
     /// If there are no other `Rc` pointers to this value, then [`Weak`]
-    /// pointers to this value will be dissassociated.
+    /// pointers to this value will be disassociated.
     ///
     /// See also [`get_mut`], which will fail rather than cloning.
     ///
@@ -799,7 +799,7 @@ impl<T: Clone> Rc<T> {
     /// assert_eq!(*other_data, 12);
     /// ```
     ///
-    /// [`Weak`] pointers will be dissassociated:
+    /// [`Weak`] pointers will be disassociated:
     ///
     /// ```
     /// use std::rc::Rc;
@@ -861,11 +861,9 @@ impl Rc<dyn Any> {
     ///     }
     /// }
     ///
-    /// fn main() {
-    ///     let my_string = "Hello World".to_string();
-    ///     print_if_string(Rc::new(my_string));
-    ///     print_if_string(Rc::new(0i8));
-    /// }
+    /// let my_string = "Hello World".to_string();
+    /// print_if_string(Rc::new(my_string));
+    /// print_if_string(Rc::new(0i8));
     /// ```
     pub fn downcast<T: Any>(self) -> Result<Rc<T>, Rc<dyn Any>> {
         if (*self).is::<T>() {
@@ -1832,8 +1830,9 @@ impl<T: ?Sized> Weak<T> {
         }
     }
 
-    /// Returns `true` if the two `Weak`s point to the same value (not just values
-    /// that compare as equal).
+    /// Returns `true` if the two `Weak`s point to the same value (not just
+    /// values that compare as equal), or if both don't point to any value
+    /// (because they were created with `Weak::new()`).
     ///
     /// # Notes
     ///
@@ -1843,7 +1842,6 @@ impl<T: ?Sized> Weak<T> {
     /// # Examples
     ///
     /// ```
-    /// #![feature(weak_ptr_eq)]
     /// use std::rc::Rc;
     ///
     /// let first_rc = Rc::new(5);
@@ -1861,7 +1859,6 @@ impl<T: ?Sized> Weak<T> {
     /// Comparing `Weak::new`.
     ///
     /// ```
-    /// #![feature(weak_ptr_eq)]
     /// use std::rc::{Rc, Weak};
     ///
     /// let first = Weak::new();
@@ -1873,7 +1870,7 @@ impl<T: ?Sized> Weak<T> {
     /// assert!(!first.ptr_eq(&third));
     /// ```
     #[inline]
-    #[unstable(feature = "weak_ptr_eq", issue = "55981")]
+    #[stable(feature = "weak_ptr_eq", since = "1.39.0")]
     pub fn ptr_eq(&self, other: &Self) -> bool {
         self.ptr.as_ptr() == other.ptr.as_ptr()
     }

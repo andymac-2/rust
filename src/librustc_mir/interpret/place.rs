@@ -8,7 +8,9 @@ use std::hash::Hash;
 use rustc::mir;
 use rustc::mir::interpret::truncate;
 use rustc::ty::{self, Ty};
-use rustc::ty::layout::{self, Size, Align, LayoutOf, TyLayout, HasDataLayout, VariantIdx};
+use rustc::ty::layout::{
+    self, Size, Align, LayoutOf, TyLayout, HasDataLayout, VariantIdx, PrimitiveExt
+};
 use rustc::ty::TypeFoldable;
 
 use super::{
@@ -191,7 +193,7 @@ impl<'tcx, Tag> MPlaceTy<'tcx, Tag> {
     pub(super) fn len(self, cx: &impl HasDataLayout) -> InterpResult<'tcx, u64> {
         if self.layout.is_unsized() {
             // We need to consult `meta` metadata
-            match self.layout.ty.sty {
+            match self.layout.ty.kind {
                 ty::Slice(..) | ty::Str =>
                     return self.mplace.meta.unwrap().to_usize(cx),
                 _ => bug!("len not supported on unsized type {:?}", self.layout.ty),
@@ -208,7 +210,7 @@ impl<'tcx, Tag> MPlaceTy<'tcx, Tag> {
 
     #[inline]
     pub(super) fn vtable(self) -> Scalar<Tag> {
-        match self.layout.ty.sty {
+        match self.layout.ty.kind {
             ty::Dynamic(..) => self.mplace.meta.unwrap(),
             _ => bug!("vtable not supported on type {:?}", self.layout.ty),
         }
@@ -375,8 +377,8 @@ where
             layout::FieldPlacement::Array { stride, .. } => {
                 let len = base.len(self)?;
                 if field >= len {
-                    // This can be violated because this runs during promotion on code where the
-                    // type system has not yet ensured that such things don't happen.
+                    // This can be violated because the index (field) can be a runtime value
+                    // provided by the user.
                     debug!("tried to access element {} of array/slice with length {}", field, len);
                     throw_panic!(BoundsCheck { len, index: field });
                 }
@@ -384,7 +386,8 @@ where
             }
             layout::FieldPlacement::Union(count) => {
                 assert!(field < count as u64,
-                        "Tried to access field {} of union with {} fields", field, count);
+                        "Tried to access field {} of union {:#?} with {} fields",
+                        field, base.layout, count);
                 // Offset is always 0
                 Size::from_bytes(0)
             }
@@ -457,7 +460,7 @@ where
 
         // Compute meta and new layout
         let inner_len = len - to - from;
-        let (meta, ty) = match base.layout.ty.sty {
+        let (meta, ty) = match base.layout.ty.kind {
             // It is not nice to match on the type, but that seems to be the only way to
             // implement this.
             ty::Array(inner, _) =>
@@ -585,8 +588,16 @@ where
         use rustc::mir::StaticKind;
 
         Ok(match place_static.kind {
-            StaticKind::Promoted(promoted, _) => {
-                let instance = self.frame().instance;
+            StaticKind::Promoted(promoted, promoted_substs) => {
+                let substs = self.subst_from_frame_and_normalize_erasing_regions(promoted_substs);
+                let instance = ty::Instance::new(place_static.def_id, substs);
+
+                // Even after getting `substs` from the frame, this instance may still be
+                // polymorphic because `ConstProp` will try to promote polymorphic MIR.
+                if instance.needs_subst() {
+                    throw_inval!(TooGeneric);
+                }
+
                 self.const_eval_raw(GlobalId {
                     instance,
                     promoted: Some(promoted),
@@ -628,45 +639,43 @@ where
     /// place; for reading, a more efficient alternative is `eval_place_for_read`.
     pub fn eval_place(
         &mut self,
-        mir_place: &mir::Place<'tcx>,
+        place: &mir::Place<'tcx>,
     ) -> InterpResult<'tcx, PlaceTy<'tcx, M::PointerTag>> {
         use rustc::mir::PlaceBase;
 
-        mir_place.iterate(|place_base, place_projection| {
-            let mut place = match place_base {
-                PlaceBase::Local(mir::RETURN_PLACE) => match self.frame().return_place {
-                    Some(return_place) => {
-                        // We use our layout to verify our assumption; caller will validate
-                        // their layout on return.
-                        PlaceTy {
-                            place: *return_place,
-                            layout: self.layout_of(
-                                self.subst_from_frame_and_normalize_erasing_regions(
-                                    self.frame().body.return_ty()
-                                )
-                            )?,
-                        }
+        let mut place_ty = match &place.base {
+            PlaceBase::Local(mir::RETURN_PLACE) => match self.frame().return_place {
+                Some(return_place) => {
+                    // We use our layout to verify our assumption; caller will validate
+                    // their layout on return.
+                    PlaceTy {
+                        place: *return_place,
+                        layout: self.layout_of(
+                            self.subst_from_frame_and_normalize_erasing_regions(
+                                self.frame().body.return_ty()
+                            )
+                        )?,
                     }
-                    None => throw_unsup!(InvalidNullPointerUsage),
+                }
+                None => throw_unsup!(InvalidNullPointerUsage),
+            },
+            PlaceBase::Local(local) => PlaceTy {
+                // This works even for dead/uninitialized locals; we check further when writing
+                place: Place::Local {
+                    frame: self.cur_frame(),
+                    local: *local,
                 },
-                PlaceBase::Local(local) => PlaceTy {
-                    // This works even for dead/uninitialized locals; we check further when writing
-                    place: Place::Local {
-                        frame: self.cur_frame(),
-                        local: *local,
-                    },
-                    layout: self.layout_of_local(self.frame(), *local, None)?,
-                },
-                PlaceBase::Static(place_static) => self.eval_static_to_mplace(place_static)?.into(),
-            };
+                layout: self.layout_of_local(self.frame(), *local, None)?,
+            },
+            PlaceBase::Static(place_static) => self.eval_static_to_mplace(&place_static)?.into(),
+        };
 
-            for proj in place_projection {
-                place = self.place_projection(place, &proj.elem)?
-            }
+        for elem in place.projection.iter() {
+            place_ty = self.place_projection(place_ty, elem)?
+        }
 
-            self.dump_place(place.place);
-            Ok(place)
-        })
+        self.dump_place(place_ty.place);
+        Ok(place_ty)
     }
 
     /// Write a scalar to a place
@@ -1028,7 +1037,7 @@ where
             }
             layout::Variants::Multiple {
                 discr_kind: layout::DiscriminantKind::Tag,
-                ref discr,
+                discr: ref discr_layout,
                 discr_index,
                 ..
             } => {
@@ -1039,7 +1048,7 @@ where
                 // raw discriminants for enums are isize or bigger during
                 // their computation, but the in-memory tag is the smallest possible
                 // representation
-                let size = discr.value.size(self);
+                let size = discr_layout.value.size(self);
                 let discr_val = truncate(discr_val, size);
 
                 let discr_dest = self.place_field(dest, discr_index as u64)?;
@@ -1051,6 +1060,7 @@ where
                     ref niche_variants,
                     niche_start,
                 },
+                discr: ref discr_layout,
                 discr_index,
                 ..
             } => {
@@ -1058,15 +1068,24 @@ where
                     variant_index.as_usize() < dest.layout.ty.ty_adt_def().unwrap().variants.len(),
                 );
                 if variant_index != dataful_variant {
-                    let niche_dest =
-                        self.place_field(dest, discr_index as u64)?;
-                    let niche_value = variant_index.as_u32() - niche_variants.start().as_u32();
-                    let niche_value = (niche_value as u128)
-                        .wrapping_add(niche_start);
-                    self.write_scalar(
-                        Scalar::from_uint(niche_value, niche_dest.layout.size),
-                        niche_dest
+                    let variants_start = niche_variants.start().as_u32();
+                    let variant_index_relative = variant_index.as_u32()
+                        .checked_sub(variants_start)
+                        .expect("overflow computing relative variant idx");
+                    // We need to use machine arithmetic when taking into account `niche_start`:
+                    // discr_val = variant_index_relative + niche_start_val
+                    let discr_layout = self.layout_of(discr_layout.value.to_int_ty(*self.tcx))?;
+                    let niche_start_val = ImmTy::from_uint(niche_start, discr_layout);
+                    let variant_index_relative_val =
+                        ImmTy::from_uint(variant_index_relative, discr_layout);
+                    let discr_val = self.binary_op(
+                        mir::BinOp::Add,
+                        variant_index_relative_val,
+                        niche_start_val,
                     )?;
+                    // Write result.
+                    let niche_dest = self.place_field(dest, discr_index as u64)?;
+                    self.write_immediate(*discr_val, niche_dest)?;
                 }
             }
         }

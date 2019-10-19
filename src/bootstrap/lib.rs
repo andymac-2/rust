@@ -103,9 +103,6 @@
 //! More documentation can be found in each respective module below, and you can
 //! also check out the `src/bootstrap/README.md` file for more information.
 
-// NO-RUSTC-WRAPPER
-#![deny(warnings, rust_2018_idioms, unused_lifetimes)]
-
 #![feature(core_intrinsics)]
 #![feature(drain_filter)]
 
@@ -497,9 +494,6 @@ impl Build {
         }
         if self.config.profiler {
             features.push_str(" profiler");
-        }
-        if self.config.wasm_syscall {
-            features.push_str(" wasm_syscall");
         }
         features
     }
@@ -1132,7 +1126,7 @@ impl Build {
         }
 
         let mut paths = Vec::new();
-        let contents = t!(fs::read(stamp));
+        let contents = t!(fs::read(stamp), &stamp);
         // This is the method we use for extracting paths from the stamp file passed to us. See
         // run_cargo for more information (in compile.rs).
         for part in contents.split(|b| *b == 0) {
@@ -1325,4 +1319,14 @@ impl Compiler {
         let final_stage = if build.config.full_bootstrap { 2 } else { 1 };
         self.stage >= final_stage
     }
+}
+
+fn envify(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '-' => '_',
+            c => c,
+        })
+        .flat_map(|c| c.to_uppercase())
+        .collect()
 }

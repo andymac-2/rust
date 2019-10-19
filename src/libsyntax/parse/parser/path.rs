@@ -9,7 +9,7 @@ use crate::symbol::kw;
 
 use std::mem;
 use log::debug;
-use errors::{Applicability};
+use errors::{Applicability, pluralise};
 
 /// Specifies how to parse a path.
 #[derive(Copy, Clone, PartialEq)]
@@ -111,12 +111,12 @@ impl<'a> Parser<'a> {
     /// Like `parse_path`, but also supports parsing `Word` meta items into paths for
     /// backwards-compatibility. This is used when parsing derive macro paths in `#[derive]`
     /// attributes.
-    pub fn parse_path_allowing_meta(&mut self, style: PathStyle) -> PResult<'a, Path> {
+    fn parse_path_allowing_meta(&mut self, style: PathStyle) -> PResult<'a, Path> {
         let meta_ident = match self.token.kind {
             token::Interpolated(ref nt) => match **nt {
-                token::NtMeta(ref meta) => match meta.node {
-                    ast::MetaItemKind::Word => Some(meta.path.clone()),
-                    _ => None,
+                token::NtMeta(ref item) => match item.tokens.is_empty() {
+                    true => Some(item.path.clone()),
+                    false => None,
                 },
                 _ => None,
             },
@@ -129,10 +129,26 @@ impl<'a> Parser<'a> {
         self.parse_path(style)
     }
 
-    crate fn parse_path_segments(&mut self,
-                           segments: &mut Vec<PathSegment>,
-                           style: PathStyle)
-                           -> PResult<'a, ()> {
+    /// Parse a list of paths inside `#[derive(path_0, ..., path_n)]`.
+    crate fn parse_derive_paths(&mut self) -> PResult<'a, Vec<Path>> {
+        self.expect(&token::OpenDelim(token::Paren))?;
+        let mut list = Vec::new();
+        while !self.eat(&token::CloseDelim(token::Paren)) {
+            let path = self.parse_path_allowing_meta(PathStyle::Mod)?;
+            list.push(path);
+            if !self.eat(&token::Comma) {
+                self.expect(&token::CloseDelim(token::Paren))?;
+                break
+            }
+        }
+        Ok(list)
+    }
+
+    pub(super) fn parse_path_segments(
+        &mut self,
+        segments: &mut Vec<PathSegment>,
+        style: PathStyle,
+    ) -> PResult<'a, ()> {
         loop {
             let segment = self.parse_path_segment(style)?;
             if style == PathStyle::Expr {
@@ -201,7 +217,7 @@ impl<'a> Parser<'a> {
             } else {
                 // `(T, U) -> R`
                 let (inputs, _) = self.parse_paren_comma_seq(|p| p.parse_ty())?;
-                let span = lo.to(self.prev_span);
+                let span = ident.span.to(self.prev_span);
                 let output = if self.eat(&token::RArrow) {
                     Some(self.parse_ty_common(false, false, false)?)
                 } else {
@@ -347,20 +363,19 @@ impl<'a> Parser<'a> {
                 let span = lo.with_hi(
                     lo.lo() + BytePos(snapshot.unmatched_angle_bracket_count)
                 );
-                let plural = snapshot.unmatched_angle_bracket_count > 1;
                 self.diagnostic()
                     .struct_span_err(
                         span,
                         &format!(
                             "unmatched angle bracket{}",
-                            if plural { "s" } else { "" }
+                            pluralise!(snapshot.unmatched_angle_bracket_count)
                         ),
                     )
                     .span_suggestion(
                         span,
                         &format!(
                             "remove extra angle bracket{}",
-                            if plural { "s" } else { "" }
+                            pluralise!(snapshot.unmatched_angle_bracket_count)
                         ),
                         String::new(),
                         Applicability::MachineApplicable,
@@ -423,7 +438,7 @@ impl<'a> Parser<'a> {
                     // FIXME(const_generics): to distinguish between idents for types and consts,
                     // we should introduce a GenericArg::Ident in the AST and distinguish when
                     // lowering to the HIR. For now, idents for const args are not permitted.
-                    if self.token.is_keyword(kw::True) || self.token.is_keyword(kw::False) {
+                    if self.token.is_bool_lit() {
                         self.parse_literal_maybe_minus()?
                     } else {
                         return Err(

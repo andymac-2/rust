@@ -31,13 +31,15 @@ use syntax::ast::{Name, Ident};
 use syntax::attr;
 
 use syntax::ast::{self, Block, ForeignItem, ForeignItemKind, Item, ItemKind, NodeId};
-use syntax::ast::{MetaItemKind, StmtKind, TraitItem, TraitItemKind, Variant};
-use syntax::ext::base::{MacroKind, SyntaxExtension};
-use syntax::ext::expand::AstFragment;
-use syntax::ext::hygiene::ExpnId;
+use syntax::ast::{MetaItemKind, StmtKind, TraitItem, TraitItemKind};
+use syntax_expand::base::{MacroKind, SyntaxExtension};
+use syntax_expand::expand::AstFragment;
+use syntax_expand::hygiene::ExpnId;
 use syntax::feature_gate::is_builtin_attr;
 use syntax::parse::token::{self, Token};
+use syntax::print::pprust;
 use syntax::{span_err, struct_span_err};
+use syntax::source_map::{respan, Spanned};
 use syntax::symbol::{kw, sym};
 use syntax::visit::{self, Visitor};
 
@@ -92,7 +94,8 @@ impl<'a> Resolver<'a> {
         where T: ToNameBinding<'a>,
     {
         let binding = def.to_name_binding(self.arenas);
-        if let Err(old_binding) = self.try_define(parent, ident, ns, binding) {
+        let key = self.new_key(ident, ns);
+        if let Err(old_binding) = self.try_define(parent, key, binding) {
             self.report_conflict(parent, ident, ns, old_binding, &binding);
         }
     }
@@ -102,8 +105,7 @@ impl<'a> Resolver<'a> {
             return self.module_map[&def_id]
         }
 
-        let macros_only = self.cstore.dep_kind_untracked(def_id.krate).macros_only();
-        if let Some(&module) = self.extern_module_map.get(&(def_id, macros_only)) {
+        if let Some(&module) = self.extern_module_map.get(&def_id) {
             return module;
         }
 
@@ -119,14 +121,15 @@ impl<'a> Resolver<'a> {
         let module = self.arenas.alloc_module(ModuleData::new(
             parent, kind, def_id, ExpnId::root(), DUMMY_SP
         ));
-        self.extern_module_map.insert((def_id, macros_only), module);
+        self.extern_module_map.insert(def_id, module);
         module
     }
 
     crate fn macro_def_scope(&mut self, expn_id: ExpnId) -> Module<'a> {
         let def_id = match self.macro_defs.get(&expn_id) {
             Some(def_id) => *def_id,
-            None => return self.graph_root,
+            None => return self.ast_transform_scopes.get(&expn_id)
+                .unwrap_or(&self.graph_root),
         };
         if let Some(id) = self.definitions.as_local_node_id(def_id) {
             self.local_macro_def_scopes[&id]
@@ -150,12 +153,12 @@ impl<'a> Resolver<'a> {
             return Some(ext.clone());
         }
 
-        let macro_def = match self.cstore.load_macro_untracked(def_id, &self.session) {
-            LoadedMacro::MacroDef(macro_def) => macro_def,
-            LoadedMacro::ProcMacro(ext) => return Some(ext),
-        };
+        let ext = Lrc::new(match self.cstore.load_macro_untracked(def_id, &self.session) {
+            LoadedMacro::MacroDef(item) =>
+                self.compile_macro(&item, self.cstore.crate_edition_untracked(def_id.krate)),
+            LoadedMacro::ProcMacro(ext) => ext,
+        });
 
-        let ext = self.compile_macro(&macro_def, self.cstore.crate_edition_untracked(def_id.krate));
         self.macro_map.insert(def_id, ext.clone());
         Some(ext)
     }
@@ -226,7 +229,7 @@ impl<'a, 'b> BuildReducedGraphVisitor<'a, 'b> {
                         .span_suggestion(
                             path.span,
                             "try",
-                            format!("crate::{}", path),
+                            format!("crate::{}", pprust::path_to_string(&path)),
                             Applicability::MaybeIncorrect,
                         )
                         .emit();
@@ -300,7 +303,7 @@ impl<'a, 'b> BuildReducedGraphVisitor<'a, 'b> {
         }
     }
 
-    fn insert_field_names(&mut self, def_id: DefId, field_names: Vec<Name>) {
+    fn insert_field_names(&mut self, def_id: DefId, field_names: Vec<Spanned<Name>>) {
         if !field_names.is_empty() {
             self.r.field_names.insert(def_id, field_names);
         }
@@ -308,7 +311,7 @@ impl<'a, 'b> BuildReducedGraphVisitor<'a, 'b> {
 
     fn block_needs_anonymous_module(&mut self, block: &Block) -> bool {
         // If any statements are items, we need to create an anonymous module
-        block.stmts.iter().any(|statement| match statement.node {
+        block.stmts.iter().any(|statement| match statement.kind {
             StmtKind::Item(_) | StmtKind::Mac(_) => true,
             _ => false,
         })
@@ -347,9 +350,12 @@ impl<'a, 'b> BuildReducedGraphVisitor<'a, 'b> {
 
         self.r.indeterminate_imports.push(directive);
         match directive.subclass {
+            // Don't add unresolved underscore imports to modules
+            SingleImport { target: Ident { name: kw::Underscore, .. }, .. } => {}
             SingleImport { target, type_ns_only, .. } => {
                 self.r.per_ns(|this, ns| if !type_ns_only || ns == TypeNS {
-                    let mut resolution = this.resolution(current_module, target, ns).borrow_mut();
+                    let key = this.new_key(target, ns);
+                    let mut resolution = this.resolution(current_module, key).borrow_mut();
                     resolution.add_single_import(directive);
                 });
             }
@@ -405,7 +411,7 @@ impl<'a, 'b> BuildReducedGraphVisitor<'a, 'b> {
         };
         match use_tree.kind {
             ast::UseTreeKind::Simple(rename, ..) => {
-                let mut ident = use_tree.ident().gensym_if_underscore();
+                let mut ident = use_tree.ident();
                 let mut module_path = prefix;
                 let mut source = module_path.pop().unwrap();
                 let mut type_ns_only = false;
@@ -579,15 +585,15 @@ impl<'a, 'b> BuildReducedGraphVisitor<'a, 'b> {
     }
 
     /// Constructs the reduced graph for one item.
-    fn build_reduced_graph_for_item(&mut self, item: &Item) {
+    fn build_reduced_graph_for_item(&mut self, item: &'b Item) {
         let parent_scope = &self.parent_scope;
         let parent = parent_scope.module;
         let expansion = parent_scope.expansion;
-        let ident = item.ident.gensym_if_underscore();
+        let ident = item.ident;
         let sp = item.span;
         let vis = self.resolve_visibility(&item.vis);
 
-        match item.node {
+        match item.kind {
             ItemKind::Use(ref use_tree) => {
                 self.build_reduced_graph_for_use_tree(
                     // This particular use tree
@@ -615,6 +621,7 @@ impl<'a, 'b> BuildReducedGraphVisitor<'a, 'b> {
                     let crate_id = self.r.crate_loader.process_extern_crate(
                         item, &self.r.definitions
                     );
+                    self.r.extern_crate_map.insert(item.id, crate_id);
                     self.r.get_module(DefId { krate: crate_id, index: CRATE_DEF_INDEX })
                 };
 
@@ -715,22 +722,17 @@ impl<'a, 'b> BuildReducedGraphVisitor<'a, 'b> {
                 self.r.define(parent, ident, TypeNS, (res, vis, sp, expansion));
             }
 
-            ItemKind::Enum(ref enum_definition, _) => {
-                let module_kind = ModuleKind::Def(
-                    DefKind::Enum,
-                    self.r.definitions.local_def_id(item.id),
-                    ident.name,
-                );
+            ItemKind::Enum(_, _) => {
+                let def_id = self.r.definitions.local_def_id(item.id);
+                self.r.variant_vis.insert(def_id, vis);
+                let module_kind = ModuleKind::Def(DefKind::Enum, def_id, ident.name);
                 let module = self.r.new_module(parent,
                                              module_kind,
                                              parent.normal_ancestor_id,
                                              expansion,
                                              item.span);
                 self.r.define(parent, ident, TypeNS, (module, vis, sp, expansion));
-
-                for variant in &(*enum_definition).variants {
-                    self.build_reduced_graph_for_variant(variant, module, vis);
-                }
+                self.parent_scope.module = module;
             }
 
             ItemKind::TraitAlias(..) => {
@@ -756,12 +758,12 @@ impl<'a, 'b> BuildReducedGraphVisitor<'a, 'b> {
                 }
 
                 // Record field names for error reporting.
-                let field_names = struct_def.fields().iter().filter_map(|field| {
+                let field_names = struct_def.fields().iter().map(|field| {
                     let field_vis = self.resolve_visibility(&field.vis);
                     if ctor_vis.is_at_least(field_vis, &*self.r) {
                         ctor_vis = field_vis;
                     }
-                    field.ident.map(|ident| ident.name)
+                    respan(field.span, field.ident.map_or(kw::Invalid, |ident| ident.name))
                 }).collect();
                 let item_def_id = self.r.definitions.local_def_id(item.id);
                 self.insert_field_names(item_def_id, field_names);
@@ -783,9 +785,9 @@ impl<'a, 'b> BuildReducedGraphVisitor<'a, 'b> {
                 self.r.define(parent, ident, TypeNS, (res, vis, sp, expansion));
 
                 // Record field names for error reporting.
-                let field_names = vdata.fields().iter().filter_map(|field| {
+                let field_names = vdata.fields().iter().map(|field| {
                     self.resolve_visibility(&field.vis);
-                    field.ident.map(|ident| ident.name)
+                    respan(field.span, field.ident.map_or(kw::Invalid, |ident| ident.name))
                 }).collect();
                 let item_def_id = self.r.definitions.local_def_id(item.id);
                 self.insert_field_names(item_def_id, field_names);
@@ -815,43 +817,9 @@ impl<'a, 'b> BuildReducedGraphVisitor<'a, 'b> {
         }
     }
 
-    // Constructs the reduced graph for one variant. Variants exist in the
-    // type and value namespaces.
-    fn build_reduced_graph_for_variant(&mut self,
-                                       variant: &Variant,
-                                       parent: Module<'a>,
-                                       vis: ty::Visibility) {
-        let expn_id = self.parent_scope.expansion;
-        let ident = variant.ident;
-
-        // Define a name in the type namespace.
-        let def_id = self.r.definitions.local_def_id(variant.id);
-        let res = Res::Def(DefKind::Variant, def_id);
-        self.r.define(parent, ident, TypeNS, (res, vis, variant.span, expn_id));
-
-        // If the variant is marked as non_exhaustive then lower the visibility to within the
-        // crate.
-        let mut ctor_vis = vis;
-        let has_non_exhaustive = attr::contains_name(&variant.attrs, sym::non_exhaustive);
-        if has_non_exhaustive && vis == ty::Visibility::Public {
-            ctor_vis = ty::Visibility::Restricted(DefId::local(CRATE_DEF_INDEX));
-        }
-
-        // Define a constructor name in the value namespace.
-        // Braced variants, unlike structs, generate unusable names in
-        // value namespace, they are reserved for possible future use.
-        // It's ok to use the variant's id as a ctor id since an
-        // error will be reported on any use of such resolution anyway.
-        let ctor_node_id = variant.data.ctor_id().unwrap_or(variant.id);
-        let ctor_def_id = self.r.definitions.local_def_id(ctor_node_id);
-        let ctor_kind = CtorKind::from_ast(&variant.data);
-        let ctor_res = Res::Def(DefKind::Ctor(CtorOf::Variant, ctor_kind), ctor_def_id);
-        self.r.define(parent, ident, ValueNS, (ctor_res, ctor_vis, variant.span, expn_id));
-    }
-
     /// Constructs the reduced graph for one foreign item.
     fn build_reduced_graph_for_foreign_item(&mut self, item: &ForeignItem) {
-        let (res, ns) = match item.node {
+        let (res, ns) = match item.kind {
             ForeignItemKind::Fn(..) => {
                 (Res::Def(DefKind::Fn, self.r.definitions.local_def_id(item.id)), ValueNS)
             }
@@ -887,10 +855,6 @@ impl<'a, 'b> BuildReducedGraphVisitor<'a, 'b> {
     fn build_reduced_graph_for_external_crate_res(&mut self, child: Export<NodeId>) {
         let parent = self.parent_scope.module;
         let Export { ident, res, vis, span } = child;
-        // FIXME: We shouldn't create the gensym here, it should come from metadata,
-        // but metadata cannot encode gensyms currently, so we create it here.
-        // This is only a guess, two equivalent idents may incorrectly get different gensyms here.
-        let ident = ident.gensym_if_underscore();
         let expansion = ExpnId::root(); // FIXME(jseyfried) intercrate hygiene
         // Record primary definitions.
         match res {
@@ -933,7 +897,8 @@ impl<'a, 'b> BuildReducedGraphVisitor<'a, 'b> {
         // Record some extra data for better diagnostics.
         match res {
             Res::Def(DefKind::Struct, def_id) | Res::Def(DefKind::Union, def_id) => {
-                let field_names = self.r.cstore.struct_field_names_untracked(def_id);
+                let field_names =
+                    self.r.cstore.struct_field_names_untracked(def_id, self.r.session);
                 self.insert_field_names(def_id, field_names);
             }
             Res::Def(DefKind::Method, def_id) => {
@@ -974,7 +939,7 @@ impl<'a, 'b> BuildReducedGraphVisitor<'a, 'b> {
                     span_err!(self.r.session, item.span, E0468,
                         "an `extern crate` loading macros must be at the crate root");
                 }
-                if let ItemKind::ExternCrate(Some(orig_name)) = item.node {
+                if let ItemKind::ExternCrate(Some(orig_name)) = item.kind {
                     if orig_name == kw::SelfLower {
                         self.r.session.span_err(attr.span,
                             "`macro_use` is not supported on `extern crate self`");
@@ -982,7 +947,7 @@ impl<'a, 'b> BuildReducedGraphVisitor<'a, 'b> {
                 }
                 let ill_formed = |span| span_err!(self.r.session, span, E0466, "bad macro import");
                 match attr.meta() {
-                    Some(meta) => match meta.node {
+                    Some(meta) => match meta.kind {
                         MetaItemKind::Word => {
                             import_all = Some(meta.span);
                             break;
@@ -1102,9 +1067,9 @@ impl<'a, 'b> BuildReducedGraphVisitor<'a, 'b> {
     fn define_macro(&mut self, item: &ast::Item) -> LegacyScope<'a> {
         let parent_scope = &self.parent_scope;
         let expansion = parent_scope.expansion;
-        let (ext, ident, span, is_legacy) = match &item.node {
+        let (ext, ident, span, is_legacy) = match &item.kind {
             ItemKind::MacroDef(def) => {
-                let ext = self.r.compile_macro(item, self.r.session.edition());
+                let ext = Lrc::new(self.r.compile_macro(item, self.r.session.edition()));
                 (ext, item.ident, item.span, def.legacy)
             }
             ItemKind::Fn(..) => match Self::proc_macro_stub(item) {
@@ -1160,7 +1125,7 @@ impl<'a, 'b> BuildReducedGraphVisitor<'a, 'b> {
 macro_rules! method {
     ($visit:ident: $ty:ty, $invoc:path, $walk:ident) => {
         fn $visit(&mut self, node: &'b $ty) {
-            if let $invoc(..) = node.node {
+            if let $invoc(..) = node.kind {
                 self.visit_invoc(node.id);
             } else {
                 visit::$walk(self, node);
@@ -1176,7 +1141,7 @@ impl<'a, 'b> Visitor<'b> for BuildReducedGraphVisitor<'a, 'b> {
     method!(visit_ty:        ast::Ty,       ast::TyKind::Mac,         walk_ty);
 
     fn visit_item(&mut self, item: &'b Item) {
-        let macro_use = match item.node {
+        let macro_use = match item.kind {
             ItemKind::MacroDef(..) => {
                 self.parent_scope.legacy = self.define_macro(item);
                 return
@@ -1188,7 +1153,6 @@ impl<'a, 'b> Visitor<'b> for BuildReducedGraphVisitor<'a, 'b> {
             ItemKind::Mod(..) => self.contains_macro_use(&item.attrs),
             _ => false,
         };
-
         let orig_current_module = self.parent_scope.module;
         let orig_current_legacy_scope = self.parent_scope.legacy;
         self.build_reduced_graph_for_item(item);
@@ -1200,7 +1164,7 @@ impl<'a, 'b> Visitor<'b> for BuildReducedGraphVisitor<'a, 'b> {
     }
 
     fn visit_stmt(&mut self, stmt: &'b ast::Stmt) {
-        if let ast::StmtKind::Mac(..) = stmt.node {
+        if let ast::StmtKind::Mac(..) = stmt.kind {
             self.parent_scope.legacy = self.visit_invoc(stmt.id);
         } else {
             visit::walk_stmt(self, stmt);
@@ -1208,7 +1172,7 @@ impl<'a, 'b> Visitor<'b> for BuildReducedGraphVisitor<'a, 'b> {
     }
 
     fn visit_foreign_item(&mut self, foreign_item: &'b ForeignItem) {
-        if let ForeignItemKind::Macro(_) = foreign_item.node {
+        if let ForeignItemKind::Macro(_) = foreign_item.kind {
             self.visit_invoc(foreign_item.id);
             return;
         }
@@ -1229,14 +1193,14 @@ impl<'a, 'b> Visitor<'b> for BuildReducedGraphVisitor<'a, 'b> {
     fn visit_trait_item(&mut self, item: &'b TraitItem) {
         let parent = self.parent_scope.module;
 
-        if let TraitItemKind::Macro(_) = item.node {
+        if let TraitItemKind::Macro(_) = item.kind {
             self.visit_invoc(item.id);
             return
         }
 
         // Add the item to the trait info.
         let item_def_id = self.r.definitions.local_def_id(item.id);
-        let (res, ns) = match item.node {
+        let (res, ns) = match item.kind {
             TraitItemKind::Const(..) => (Res::Def(DefKind::AssocConst, item_def_id), ValueNS),
             TraitItemKind::Method(ref sig, _) => {
                 if sig.decl.has_self() {
@@ -1252,15 +1216,13 @@ impl<'a, 'b> Visitor<'b> for BuildReducedGraphVisitor<'a, 'b> {
         let expansion = self.parent_scope.expansion;
         self.r.define(parent, item.ident, ns, (res, vis, item.span, expansion));
 
-        self.parent_scope.module = parent.parent.unwrap(); // nearest normal ancestor
         visit::walk_trait_item(self, item);
-        self.parent_scope.module = parent;
     }
 
     fn visit_token(&mut self, t: Token) {
         if let token::Interpolated(nt) = t.kind {
             if let token::NtExpr(ref expr) = *nt {
-                if let ast::ExprKind::Mac(..) = expr.node {
+                if let ast::ExprKind::Mac(..) = expr.kind {
                     self.visit_invoc(expr.id);
                 }
             }
@@ -1272,5 +1234,93 @@ impl<'a, 'b> Visitor<'b> for BuildReducedGraphVisitor<'a, 'b> {
             self.r.builtin_attrs.push((attr.path.segments[0].ident, self.parent_scope));
         }
         visit::walk_attribute(self, attr);
+    }
+
+    fn visit_arm(&mut self, arm: &'b ast::Arm) {
+        if arm.is_placeholder {
+            self.visit_invoc(arm.id);
+        } else {
+            visit::walk_arm(self, arm);
+        }
+    }
+
+    fn visit_field(&mut self, f: &'b ast::Field) {
+        if f.is_placeholder {
+            self.visit_invoc(f.id);
+        } else {
+            visit::walk_field(self, f);
+        }
+    }
+
+    fn visit_field_pattern(&mut self, fp: &'b ast::FieldPat) {
+        if fp.is_placeholder {
+            self.visit_invoc(fp.id);
+        } else {
+            visit::walk_field_pattern(self, fp);
+        }
+    }
+
+    fn visit_generic_param(&mut self, param: &'b ast::GenericParam) {
+        if param.is_placeholder {
+            self.visit_invoc(param.id);
+        } else {
+            visit::walk_generic_param(self, param);
+        }
+    }
+
+    fn visit_param(&mut self, p: &'b ast::Param) {
+        if p.is_placeholder {
+            self.visit_invoc(p.id);
+        } else {
+            visit::walk_param(self, p);
+        }
+    }
+
+    fn visit_struct_field(&mut self, sf: &'b ast::StructField) {
+        if sf.is_placeholder {
+            self.visit_invoc(sf.id);
+        } else {
+            visit::walk_struct_field(self, sf);
+        }
+    }
+
+    // Constructs the reduced graph for one variant. Variants exist in the
+    // type and value namespaces.
+    fn visit_variant(&mut self, variant: &'b ast::Variant) {
+        if variant.is_placeholder {
+            self.visit_invoc(variant.id);
+            return;
+        }
+
+        let parent = self.parent_scope.module;
+        let vis = self.r.variant_vis[&parent.def_id().expect("enum without def-id")];
+        let expn_id = self.parent_scope.expansion;
+        let ident = variant.ident;
+
+        // Define a name in the type namespace.
+        let def_id = self.r.definitions.local_def_id(variant.id);
+        let res = Res::Def(DefKind::Variant, def_id);
+        self.r.define(parent, ident, TypeNS, (res, vis, variant.span, expn_id));
+
+        // If the variant is marked as non_exhaustive then lower the visibility to within the
+        // crate.
+        let mut ctor_vis = vis;
+        let has_non_exhaustive = attr::contains_name(&variant.attrs, sym::non_exhaustive);
+        if has_non_exhaustive && vis == ty::Visibility::Public {
+            ctor_vis = ty::Visibility::Restricted(DefId::local(CRATE_DEF_INDEX));
+        }
+
+        // Define a constructor name in the value namespace.
+        // Braced variants, unlike structs, generate unusable names in
+        // value namespace, they are reserved for possible future use.
+        // It's ok to use the variant's id as a ctor id since an
+        // error will be reported on any use of such resolution anyway.
+        let ctor_node_id = variant.data.ctor_id().unwrap_or(variant.id);
+        let ctor_def_id = self.r.definitions.local_def_id(ctor_node_id);
+        let ctor_kind = CtorKind::from_ast(&variant.data);
+        let ctor_res = Res::Def(DefKind::Ctor(CtorOf::Variant, ctor_kind), ctor_def_id);
+        self.r.define(parent, ident, ValueNS, (ctor_res, ctor_vis, variant.span, expn_id));
+
+        visit::walk_variant(self, variant);
     }
 }

@@ -87,7 +87,6 @@
 #![feature(link_llvm_intrinsics)]
 #![feature(never_type)]
 #![feature(nll)]
-#![feature(bind_by_move_pattern_guards)]
 #![feature(exhaustive_patterns)]
 #![feature(no_core)]
 #![feature(on_unimplemented)]
@@ -120,9 +119,6 @@
 #![feature(rtm_target_feature)]
 #![feature(f16c_target_feature)]
 #![feature(hexagon_target_feature)]
-#![feature(const_slice_len)]
-#![feature(const_str_as_bytes)]
-#![feature(const_str_len)]
 #![feature(const_int_conversion)]
 #![feature(const_transmute)]
 #![feature(non_exhaustive)]
@@ -131,7 +127,6 @@
 #![feature(adx_target_feature)]
 #![feature(maybe_uninit_slice)]
 #![feature(external_doc)]
-#![feature(mem_take)]
 #![feature(associated_type_bounds)]
 
 #[prelude_import]
@@ -227,6 +222,7 @@ pub mod task;
 pub mod alloc;
 
 // note: does not need to be public
+mod bool;
 mod tuple;
 mod unit;
 

@@ -1042,7 +1042,7 @@ impl<T: ?Sized> *const T {
         (self as *const u8) == null()
     }
 
-    /// Cast to a pointer to a different type
+    /// Casts to a pointer of another type.
     #[stable(feature = "ptr_cast", since = "1.38.0")]
     #[inline]
     pub const fn cast<U>(self) -> *const U {
@@ -1726,7 +1726,7 @@ impl<T: ?Sized> *mut T {
         (self as *mut u8) == null_mut()
     }
 
-    /// Cast to a pointer to a different type
+    /// Casts to a pointer of another type.
     #[stable(feature = "ptr_cast", since = "1.38.0")]
     #[inline]
     pub const fn cast<U>(self) -> *mut U {
@@ -2732,31 +2732,29 @@ impl<T: ?Sized> Eq for *mut T {}
 /// impl Trait for Wrapper {}
 /// impl Trait for i32 {}
 ///
-/// fn main() {
-///     let wrapper = Wrapper { member: 10 };
+/// let wrapper = Wrapper { member: 10 };
 ///
-///     // Pointers have equal addresses.
-///     assert!(std::ptr::eq(
-///         &wrapper as *const Wrapper as *const u8,
-///         &wrapper.member as *const i32 as *const u8
-///     ));
+/// // Pointers have equal addresses.
+/// assert!(std::ptr::eq(
+///     &wrapper as *const Wrapper as *const u8,
+///     &wrapper.member as *const i32 as *const u8
+/// ));
 ///
-///     // Objects have equal addresses, but `Trait` has different implementations.
-///     assert!(!std::ptr::eq(
-///         &wrapper as &dyn Trait,
-///         &wrapper.member as &dyn Trait,
-///     ));
-///     assert!(!std::ptr::eq(
-///         &wrapper as &dyn Trait as *const dyn Trait,
-///         &wrapper.member as &dyn Trait as *const dyn Trait,
-///     ));
+/// // Objects have equal addresses, but `Trait` has different implementations.
+/// assert!(!std::ptr::eq(
+///     &wrapper as &dyn Trait,
+///     &wrapper.member as &dyn Trait,
+/// ));
+/// assert!(!std::ptr::eq(
+///     &wrapper as &dyn Trait as *const dyn Trait,
+///     &wrapper.member as &dyn Trait as *const dyn Trait,
+/// ));
 ///
-///     // Converting the reference to a `*const u8` compares by address.
-///     assert!(std::ptr::eq(
-///         &wrapper as &dyn Trait as *const dyn Trait as *const u8,
-///         &wrapper.member as &dyn Trait as *const dyn Trait as *const u8,
-///     ));
-/// }
+/// // Converting the reference to a `*const u8` compares by address.
+/// assert!(std::ptr::eq(
+///     &wrapper as &dyn Trait as *const dyn Trait as *const u8,
+///     &wrapper.member as &dyn Trait as *const dyn Trait as *const u8,
+/// ));
 /// ```
 #[stable(feature = "ptr_eq", since = "1.17.0")]
 #[inline]

@@ -3,8 +3,9 @@ use crate::lint;
 use crate::middle::cstore;
 use crate::session::config::{
     build_configuration,
-    build_session_options_and_crate_config,
-    to_crate_config
+    build_session_options,
+    to_crate_config,
+    parse_cfgspecs,
 };
 use crate::session::config::{LtoCli, LinkerPluginLto, SwitchWithOptPath, ExternEntry};
 use crate::session::build_session;
@@ -18,6 +19,16 @@ use syntax::symbol::sym;
 use syntax::edition::{Edition, DEFAULT_EDITION};
 use syntax;
 use super::Options;
+use rustc_data_structures::fx::FxHashSet;
+
+pub fn build_session_options_and_crate_config(
+    matches: &getopts::Matches,
+) -> (Options, FxHashSet<(String, Option<String>)>) {
+    (
+        build_session_options(matches),
+        parse_cfgspecs(matches.opt_strs("cfg")),
+    )
+}
 
 impl ExternEntry {
     fn new_public<S: Into<String>,
@@ -87,7 +98,7 @@ fn test_can_print_warnings() {
         let registry = errors::registry::Registry::new(&[]);
         let (sessopts, _) = build_session_options_and_crate_config(&matches);
         let sess = build_session(sessopts, None, registry);
-        assert!(!sess.diagnostic().flags.can_emit_warnings);
+        assert!(!sess.diagnostic().can_emit_warnings());
     });
 
     syntax::with_default_globals(|| {
@@ -97,7 +108,7 @@ fn test_can_print_warnings() {
         let registry = errors::registry::Registry::new(&[]);
         let (sessopts, _) = build_session_options_and_crate_config(&matches);
         let sess = build_session(sessopts, None, registry);
-        assert!(sess.diagnostic().flags.can_emit_warnings);
+        assert!(sess.diagnostic().can_emit_warnings());
     });
 
     syntax::with_default_globals(|| {
@@ -105,7 +116,7 @@ fn test_can_print_warnings() {
         let registry = errors::registry::Registry::new(&[]);
         let (sessopts, _) = build_session_options_and_crate_config(&matches);
         let sess = build_session(sessopts, None, registry);
-        assert!(sess.diagnostic().flags.can_emit_warnings);
+        assert!(sess.diagnostic().can_emit_warnings());
     });
 }
 
@@ -588,14 +599,6 @@ fn test_debugging_options_tracking_hash() {
     opts.debugging_opts.ls = true;
     assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
     opts.debugging_opts.save_analysis = true;
-    assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
-    opts.debugging_opts.flowgraph_print_loans = true;
-    assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
-    opts.debugging_opts.flowgraph_print_moves = true;
-    assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
-    opts.debugging_opts.flowgraph_print_assigns = true;
-    assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
-    opts.debugging_opts.flowgraph_print_all = true;
     assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
     opts.debugging_opts.print_region_graph = true;
     assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());

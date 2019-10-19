@@ -12,7 +12,7 @@
 #![feature(non_exhaustive)]
 #![feature(optin_builtin_traits)]
 #![feature(rustc_attrs)]
-#![feature(proc_macro_hygiene)]
+#![cfg_attr(bootstrap, feature(proc_macro_hygiene))]
 #![feature(specialization)]
 #![feature(step_trait)]
 
@@ -442,6 +442,7 @@ impl Span {
                 let (pre, post) = match expn_data.kind {
                     ExpnKind::Root => break,
                     ExpnKind::Desugaring(..) => ("desugaring of ", ""),
+                    ExpnKind::AstPass(..) => ("", ""),
                     ExpnKind::Macro(macro_kind, _) => match macro_kind {
                         MacroKind::Bang => ("", "!"),
                         MacroKind::Attr => ("#[", "]"),
@@ -511,6 +512,24 @@ impl Span {
         Span::new(span.lo + BytePos::from_usize(inner.start),
                   span.lo + BytePos::from_usize(inner.end),
                   span.ctxt)
+    }
+
+    /// Equivalent of `Span::def_site` from the proc macro API,
+    /// except that the location is taken from the `self` span.
+    pub fn with_def_site_ctxt(self, expn_id: ExpnId) -> Span {
+        self.with_ctxt_from_mark(expn_id, Transparency::Opaque)
+    }
+
+    /// Equivalent of `Span::call_site` from the proc macro API,
+    /// except that the location is taken from the `self` span.
+    pub fn with_call_site_ctxt(&self, expn_id: ExpnId) -> Span {
+        self.with_ctxt_from_mark(expn_id, Transparency::Transparent)
+    }
+
+    /// Equivalent of `Span::mixed_site` from the proc macro API,
+    /// except that the location is taken from the `self` span.
+    pub fn with_mixed_site_ctxt(&self, expn_id: ExpnId) -> Span {
+        self.with_ctxt_from_mark(expn_id, Transparency::SemiTransparent)
     }
 
     /// Produces a span with the same location as `self` and context produced by a macro with the
@@ -871,7 +890,7 @@ pub struct OffsetOverflowError;
 /// A single source in the `SourceMap`.
 #[derive(Clone)]
 pub struct SourceFile {
-    /// The name of the file that the source came from, source that doesn't
+    /// The name of the file that the source came from. Source that doesn't
     /// originate from files has names between angle brackets by convention
     /// (e.g., `<anon>`).
     pub name: FileName,
@@ -909,9 +928,9 @@ impl Encodable for SourceFile {
             s.emit_struct_field("name", 0, |s| self.name.encode(s))?;
             s.emit_struct_field("name_was_remapped", 1, |s| self.name_was_remapped.encode(s))?;
             s.emit_struct_field("src_hash", 2, |s| self.src_hash.encode(s))?;
-            s.emit_struct_field("start_pos", 4, |s| self.start_pos.encode(s))?;
-            s.emit_struct_field("end_pos", 5, |s| self.end_pos.encode(s))?;
-            s.emit_struct_field("lines", 6, |s| {
+            s.emit_struct_field("start_pos", 3, |s| self.start_pos.encode(s))?;
+            s.emit_struct_field("end_pos", 4, |s| self.end_pos.encode(s))?;
+            s.emit_struct_field("lines", 5, |s| {
                 let lines = &self.lines[..];
                 // Store the length.
                 s.emit_u32(lines.len() as u32)?;
@@ -957,13 +976,13 @@ impl Encodable for SourceFile {
 
                 Ok(())
             })?;
-            s.emit_struct_field("multibyte_chars", 7, |s| {
+            s.emit_struct_field("multibyte_chars", 6, |s| {
                 self.multibyte_chars.encode(s)
             })?;
-            s.emit_struct_field("non_narrow_chars", 8, |s| {
+            s.emit_struct_field("non_narrow_chars", 7, |s| {
                 self.non_narrow_chars.encode(s)
             })?;
-            s.emit_struct_field("name_hash", 9, |s| {
+            s.emit_struct_field("name_hash", 8, |s| {
                 self.name_hash.encode(s)
             })
         })
@@ -972,7 +991,6 @@ impl Encodable for SourceFile {
 
 impl Decodable for SourceFile {
     fn decode<D: Decoder>(d: &mut D) -> Result<SourceFile, D::Error> {
-
         d.read_struct("SourceFile", 8, |d| {
             let name: FileName = d.read_struct_field("name", 0, |d| Decodable::decode(d))?;
             let name_was_remapped: bool =
@@ -980,9 +998,9 @@ impl Decodable for SourceFile {
             let src_hash: u128 =
                 d.read_struct_field("src_hash", 2, |d| Decodable::decode(d))?;
             let start_pos: BytePos =
-                d.read_struct_field("start_pos", 4, |d| Decodable::decode(d))?;
-            let end_pos: BytePos = d.read_struct_field("end_pos", 5, |d| Decodable::decode(d))?;
-            let lines: Vec<BytePos> = d.read_struct_field("lines", 6, |d| {
+                d.read_struct_field("start_pos", 3, |d| Decodable::decode(d))?;
+            let end_pos: BytePos = d.read_struct_field("end_pos", 4, |d| Decodable::decode(d))?;
+            let lines: Vec<BytePos> = d.read_struct_field("lines", 5, |d| {
                 let num_lines: u32 = Decodable::decode(d)?;
                 let mut lines = Vec::with_capacity(num_lines as usize);
 
@@ -1011,18 +1029,18 @@ impl Decodable for SourceFile {
                 Ok(lines)
             })?;
             let multibyte_chars: Vec<MultiByteChar> =
-                d.read_struct_field("multibyte_chars", 7, |d| Decodable::decode(d))?;
+                d.read_struct_field("multibyte_chars", 6, |d| Decodable::decode(d))?;
             let non_narrow_chars: Vec<NonNarrowChar> =
-                d.read_struct_field("non_narrow_chars", 8, |d| Decodable::decode(d))?;
+                d.read_struct_field("non_narrow_chars", 7, |d| Decodable::decode(d))?;
             let name_hash: u128 =
-                d.read_struct_field("name_hash", 9, |d| Decodable::decode(d))?;
+                d.read_struct_field("name_hash", 8, |d| Decodable::decode(d))?;
             Ok(SourceFile {
                 name,
                 name_was_remapped,
                 unmapped_path: None,
                 // `crate_of_origin` has to be set by the importer.
-                // This value matches up with rustc::hir::def_id::INVALID_CRATE.
-                // That constant is not available here unfortunately :(
+                // This value matches up with `rustc::hir::def_id::INVALID_CRATE`.
+                // That constant is not available here, unfortunately.
                 crate_of_origin: std::u32::MAX - 1,
                 start_pos,
                 end_pos,
@@ -1054,14 +1072,14 @@ impl SourceFile {
         normalize_newlines(&mut src);
 
         let src_hash = {
-            let mut hasher: StableHasher<u128> = StableHasher::new();
+            let mut hasher: StableHasher = StableHasher::new();
             hasher.write(src.as_bytes());
-            hasher.finish()
+            hasher.finish::<u128>()
         };
         let name_hash = {
-            let mut hasher: StableHasher<u128> = StableHasher::new();
+            let mut hasher: StableHasher = StableHasher::new();
             name.hash(&mut hasher);
-            hasher.finish()
+            hasher.finish::<u128>()
         };
         let end_pos = start_pos.to_usize() + src.len();
         if end_pos > u32::max_value() as usize {
@@ -1107,10 +1125,10 @@ impl SourceFile {
             // Check that no-one else have provided the source while we were getting it
             if *external_src == ExternalSource::AbsentOk {
                 if let Some(src) = src {
-                    let mut hasher: StableHasher<u128> = StableHasher::new();
+                    let mut hasher: StableHasher = StableHasher::new();
                     hasher.write(src.as_bytes());
 
-                    if hasher.finish() == self.src_hash {
+                    if hasher.finish::<u128>() == self.src_hash {
                         *external_src = ExternalSource::Present(src);
                         return true;
                     }

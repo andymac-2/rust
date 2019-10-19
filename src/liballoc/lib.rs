@@ -117,12 +117,10 @@
 #![feature(allocator_internals)]
 #![feature(on_unimplemented)]
 #![feature(rustc_const_unstable)]
-#![feature(const_vec_new)]
 #![feature(slice_partition_dedup)]
 #![feature(maybe_uninit_extra, maybe_uninit_slice)]
 #![feature(alloc_layout_extra)]
 #![feature(try_trait)]
-#![feature(mem_take)]
 #![feature(associated_type_bounds)]
 
 // Allow testing this library
@@ -155,7 +153,7 @@ mod boxed {
 #[cfg(test)]
 mod tests;
 pub mod collections;
-#[cfg(all(target_has_atomic = "ptr", target_has_atomic = "cas"))]
+#[cfg(target_has_atomic = "ptr")]
 pub mod sync;
 pub mod rc;
 pub mod raw_vec;
@@ -170,4 +168,10 @@ pub mod vec;
 #[cfg(not(test))]
 mod std {
     pub use core::ops; // RangeFull
+}
+
+#[doc(hidden)]
+#[unstable(feature = "liballoc_internals", issue = "0", reason = "implementation detail")]
+pub mod __export {
+    pub use core::format_args;
 }

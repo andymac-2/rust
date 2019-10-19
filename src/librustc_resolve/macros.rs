@@ -8,23 +8,26 @@ use crate::{ModuleOrUniformRoot, KNOWN_TOOLS};
 use crate::Namespace::*;
 use crate::resolve_imports::ImportResolver;
 use rustc::hir::def::{self, DefKind, NonMacroAttrKind};
+use rustc::hir::def_id;
 use rustc::middle::stability;
 use rustc::{ty, lint, span_bug};
 use syntax::ast::{self, NodeId, Ident};
 use syntax::attr::StabilityLevel;
 use syntax::edition::Edition;
-use syntax::ext::base::{self, Indeterminate, SpecialDerives};
-use syntax::ext::base::{MacroKind, SyntaxExtension};
-use syntax::ext::expand::{AstFragment, Invocation, InvocationKind};
-use syntax::ext::hygiene::{self, ExpnId, ExpnData, ExpnKind};
-use syntax::ext::tt::macro_rules;
+use syntax_expand::base::{self, InvocationRes, Indeterminate, SpecialDerives};
+use syntax_expand::base::{MacroKind, SyntaxExtension};
+use syntax_expand::expand::{AstFragment, AstFragmentKind, Invocation, InvocationKind};
+use syntax_expand::hygiene::{self, ExpnId, ExpnData, ExpnKind};
+use syntax_expand::compile_declarative_macro;
 use syntax::feature_gate::{emit_feature_err, is_builtin_attr_name};
 use syntax::feature_gate::GateIssue;
+use syntax::print::pprust;
 use syntax::symbol::{Symbol, kw, sym};
 use syntax_pos::{Span, DUMMY_SP};
 
 use std::{mem, ptr};
 use rustc_data_structures::sync::Lrc;
+use syntax_pos::hygiene::AstPass;
 
 type Res = def::Res<NodeId>;
 
@@ -95,16 +98,6 @@ impl<'a> base::Resolver for Resolver<'a> {
         self.session.next_node_id()
     }
 
-    fn get_module_scope(&mut self, id: NodeId) -> ExpnId {
-        let expn_id = ExpnId::fresh(Some(ExpnData::default(
-            ExpnKind::Macro(MacroKind::Attr, sym::test_case), DUMMY_SP, self.session.edition()
-        )));
-        let module = self.module_map[&self.definitions.local_def_id(id)];
-        self.invocation_parent_scopes.insert(expn_id, ParentScope::module(module));
-        self.definitions.set_invocation_parent(expn_id, module.def_id().unwrap().index);
-        expn_id
-    }
-
     fn resolve_dollar_crates(&mut self) {
         hygiene::update_dollar_crate_names(|ctxt| {
             let ident = Ident::new(kw::DollarCrate, DUMMY_SP.with_ctxt(ctxt));
@@ -136,13 +129,44 @@ impl<'a> base::Resolver for Resolver<'a> {
         }
     }
 
+    // Create a new Expansion with a definition site of the provided module, or
+    // a fake empty `#[no_implicit_prelude]` module if no module is provided.
+    fn expansion_for_ast_pass(
+        &mut self,
+        call_site: Span,
+        pass: AstPass,
+        features: &[Symbol],
+        parent_module_id: Option<NodeId>,
+    ) -> ExpnId {
+        let expn_id = ExpnId::fresh(Some(ExpnData::allow_unstable(
+            ExpnKind::AstPass(pass),
+            call_site,
+            self.session.edition(),
+            features.into(),
+        )));
+
+        let parent_scope = if let Some(module_id) = parent_module_id {
+            let parent_def_id = self.definitions.local_def_id(module_id);
+            self.definitions.add_parent_module_of_macro_def(expn_id, parent_def_id);
+            self.module_map[&parent_def_id]
+        } else {
+            self.definitions.add_parent_module_of_macro_def(
+                expn_id,
+                def_id::DefId::local(def_id::CRATE_DEF_INDEX),
+            );
+            self.empty_module
+        };
+        self.ast_transform_scopes.insert(expn_id, parent_scope);
+        expn_id
+    }
+
     fn resolve_imports(&mut self) {
         ImportResolver { r: self }.resolve_imports()
     }
 
     fn resolve_macro_invocation(
         &mut self, invoc: &Invocation, eager_expansion_root: ExpnId, force: bool
-    ) -> Result<Option<Lrc<SyntaxExtension>>, Indeterminate> {
+    ) -> Result<InvocationRes, Indeterminate> {
         let invoc_id = invoc.expansion_data.id;
         let parent_scope = match self.invocation_parent_scopes.get(&invoc_id) {
             Some(parent_scope) => *parent_scope,
@@ -165,25 +189,24 @@ impl<'a> base::Resolver for Resolver<'a> {
             InvocationKind::Derive { ref path, .. } =>
                 (path, MacroKind::Derive, &[][..], false),
             InvocationKind::DeriveContainer { ref derives, .. } => {
-                // Block expansion of derives in the container until we know whether one of them
-                // is a built-in `Copy`. Skip the resolution if there's only one derive - either
-                // it's not a `Copy` and we don't need to do anything, or it's a `Copy` and it
-                // will automatically knows about itself.
-                let mut result = Ok(None);
-                if derives.len() > 1 {
-                    for path in derives {
-                        match self.resolve_macro_path(path, Some(MacroKind::Derive),
-                                                      &parent_scope, true, force) {
-                            Ok((Some(ref ext), _)) if ext.is_derive_copy => {
-                                self.add_derives(invoc_id, SpecialDerives::COPY);
-                                return Ok(None);
-                            }
-                            Err(Determinacy::Undetermined) => result = Err(Indeterminate),
-                            _ => {}
-                        }
-                    }
+                // Block expansion of the container until we resolve all derives in it.
+                // This is required for two reasons:
+                // - Derive helper attributes are in scope for the item to which the `#[derive]`
+                //   is applied, so they have to be produced by the container's expansion rather
+                //   than by individual derives.
+                // - Derives in the container need to know whether one of them is a built-in `Copy`.
+                // FIXME: Try to avoid repeated resolutions for derives here and in expansion.
+                let mut exts = Vec::new();
+                for path in derives {
+                    exts.push(match self.resolve_macro_path(
+                        path, Some(MacroKind::Derive), &parent_scope, true, force
+                    ) {
+                        Ok((Some(ext), _)) => ext,
+                        Ok(_) | Err(Determinacy::Determined) => self.dummy_ext(MacroKind::Derive),
+                        Err(Determinacy::Undetermined) => return Err(Indeterminate),
+                    })
                 }
-                return result;
+                return Ok(InvocationRes::DeriveContainer(exts));
             }
         };
 
@@ -203,7 +226,28 @@ impl<'a> base::Resolver for Resolver<'a> {
             self.definitions.add_parent_module_of_macro_def(invoc_id, normal_module_def_id);
         }
 
-        Ok(Some(ext))
+        match invoc.fragment_kind {
+            AstFragmentKind::Arms
+                | AstFragmentKind::Fields
+                | AstFragmentKind::FieldPats
+                | AstFragmentKind::GenericParams
+                | AstFragmentKind::Params
+                | AstFragmentKind::StructFields
+                | AstFragmentKind::Variants =>
+            {
+                if let Res::Def(..) = res {
+                    self.session.span_err(
+                        span,
+                        &format!("expected an inert attribute, found {} {}",
+                                 res.article(), res.descr()),
+                    );
+                    return Ok(InvocationRes::Single(self.dummy_ext(kind)));
+                }
+            },
+            _ => {}
+        }
+
+        Ok(InvocationRes::Single(ext))
     }
 
     fn check_unused_macros(&self) {
@@ -280,8 +324,9 @@ impl<'a> Resolver<'a> {
         self.check_stability_and_deprecation(&ext, path);
 
         Ok(if ext.macro_kind() != kind {
-            let expected = if kind == MacroKind::Attr { "attribute" } else  { kind.descr() };
-            let msg = format!("expected {}, found {} `{}`", expected, res.descr(), path);
+            let expected = kind.descr_expected();
+            let path_str = pprust::path_to_string(path);
+            let msg = format!("expected {}, found {} `{}`", expected, res.descr(), path_str);
             self.session.struct_span_err(path.span, &msg)
                         .span_label(path.span, format!("not {} {}", kind.article(), expected))
                         .emit();
@@ -730,10 +775,8 @@ impl<'a> Resolver<'a> {
                     check_consistency(self, &[seg], ident.span, kind, initial_res, res);
                 }
                 Err(..) => {
-                    assert!(initial_binding.is_none());
-                    let bang = if kind == MacroKind::Bang { "!" } else { "" };
-                    let msg =
-                        format!("cannot find {} `{}{}` in this scope", kind.descr(), ident, bang);
+                    let expected = kind.descr_expected();
+                    let msg = format!("cannot find {} `{}` in this scope", expected, ident);
                     let mut err = self.session.struct_span_err(ident.span, &msg);
                     self.unresolved_macro_suggestions(&mut err, kind, &parent_scope, ident);
                     err.emit();
@@ -752,21 +795,28 @@ impl<'a> Resolver<'a> {
     fn check_stability_and_deprecation(&self, ext: &SyntaxExtension, path: &ast::Path) {
         let span = path.span;
         if let Some(stability) = &ext.stability {
-            if let StabilityLevel::Unstable { reason, issue } = stability.level {
+            if let StabilityLevel::Unstable { reason, issue, is_soft } = stability.level {
                 let feature = stability.feature;
                 if !self.active_features.contains(&feature) && !span.allows_unstable(feature) {
-                    stability::report_unstable(self.session, feature, reason, issue, span);
+                    let node_id = ast::CRATE_NODE_ID;
+                    let soft_handler =
+                        |lint, span, msg: &_| self.session.buffer_lint(lint, node_id, span, msg);
+                    stability::report_unstable(
+                        self.session, feature, reason, issue, is_soft, span, soft_handler
+                    );
                 }
             }
             if let Some(depr) = &stability.rustc_depr {
-                let (message, lint) = stability::rustc_deprecation_message(depr, &path.to_string());
+                let path = pprust::path_to_string(path);
+                let (message, lint) = stability::rustc_deprecation_message(depr, &path);
                 stability::early_report_deprecation(
                     self.session, &message, depr.suggestion, lint, span
                 );
             }
         }
         if let Some(depr) = &ext.deprecation {
-            let (message, lint) = stability::deprecation_message(depr, &path.to_string());
+            let path = pprust::path_to_string(&path);
+            let (message, lint) = stability::deprecation_message(depr, &path);
             stability::early_report_deprecation(self.session, &message, None, lint, span);
         }
     }
@@ -800,8 +850,8 @@ impl<'a> Resolver<'a> {
 
     /// Compile the macro into a `SyntaxExtension` and possibly replace it with a pre-defined
     /// extension partially or entirely for built-in macros and legacy plugin macros.
-    crate fn compile_macro(&mut self, item: &ast::Item, edition: Edition) -> Lrc<SyntaxExtension> {
-        let mut result = macro_rules::compile(
+    crate fn compile_macro(&mut self, item: &ast::Item, edition: Edition) -> SyntaxExtension {
+        let mut result = compile_declarative_macro(
             &self.session.parse_sess, self.session.features_untracked(), item, edition
         );
 
@@ -822,6 +872,6 @@ impl<'a> Resolver<'a> {
             }
         }
 
-        Lrc::new(result)
+        result
     }
 }

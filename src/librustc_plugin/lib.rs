@@ -21,7 +21,7 @@
 //! extern crate syntax_pos;
 //!
 //! use rustc_driver::plugin::Registry;
-//! use syntax::ext::base::{ExtCtxt, MacResult};
+//! use syntax_expand::base::{ExtCtxt, MacResult};
 //! use syntax_pos::Span;
 //! use syntax::tokenstream::TokenTree;
 //!
@@ -54,15 +54,12 @@
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/")]
 
 #![feature(nll)]
-#![feature(rustc_diagnostic_macros)]
 
 #![recursion_limit="256"]
 
 pub use registry::Registry;
 
-mod error_codes;
+pub mod error_codes;
 pub mod registry;
 pub mod load;
 pub mod build;
-
-__build_diagnostic_array! { librustc_plugin, DIAGNOSTICS }

@@ -25,12 +25,12 @@ fn parse_item_from_source_str(name: FileName, source: String, sess: &ParseSess)
     new_parser_from_source_str(sess, name, source).parse_item()
 }
 
-// produce a syntax_pos::span
+// Produces a `syntax_pos::span`.
 fn sp(a: u32, b: u32) -> Span {
     Span::with_root_ctxt(BytePos(a), BytePos(b))
 }
 
-/// Parse a string, return an expr
+/// Parses a string, return an expression.
 fn string_to_expr(source_str : String) -> P<ast::Expr> {
     let ps = ParseSess::new(FilePathMapping::empty());
     with_error_checking_parse(source_str, &ps, |p| {
@@ -38,7 +38,7 @@ fn string_to_expr(source_str : String) -> P<ast::Expr> {
     })
 }
 
-/// Parse a string, return an item
+/// Parses a string, returns an item.
 fn string_to_item(source_str : String) -> Option<P<ast::Item>> {
     let ps = ParseSess::new(FilePathMapping::empty());
     with_error_checking_parse(source_str, &ps, |p| {
@@ -53,7 +53,7 @@ fn string_to_item(source_str : String) -> Option<P<ast::Item>> {
     })
 }
 
-// check the token-tree-ization of macros
+// Checks the token-tree-ization of macros.
 #[test]
 fn string_to_tts_macro () {
     with_default_globals(|| {
@@ -171,7 +171,7 @@ fn get_spans_of_pat_idents(src: &str) -> Vec<Span> {
     }
     impl<'a> crate::visit::Visitor<'a> for PatIdentVisitor {
         fn visit_pat(&mut self, p: &'a ast::Pat) {
-            match p.node {
+            match p.kind {
                 PatKind::Ident(_ , ref ident, _) => {
                     self.spans.push(ident.span.clone());
                 }
@@ -272,7 +272,7 @@ fn ttdelim_span() {
         let expr = parse_expr_from_source_str(PathBuf::from("foo").into(),
             "foo!( fn main() { body } )".to_string(), &sess).unwrap();
 
-        let tts: Vec<_> = match expr.node {
+        let tts: Vec<_> = match expr.kind {
             ast::ExprKind::Mac(ref mac) => mac.stream().trees().collect(),
             _ => panic!("not a macro"),
         };
@@ -299,7 +299,7 @@ fn out_of_line_mod() {
             &sess,
         ).unwrap().unwrap();
 
-        if let ast::ItemKind::Mod(ref m) = item.node {
+        if let ast::ItemKind::Mod(ref m) = item.kind {
             assert!(m.items.len() == 2);
         } else {
             panic!();

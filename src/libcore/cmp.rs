@@ -9,14 +9,22 @@
 //! * [`Ord`] and [`PartialOrd`] are traits that allow you to define total and
 //!   partial orderings between values, respectively. Implementing them overloads
 //!   the `<`, `<=`, `>`, and `>=` operators.
-//! * [`Ordering`][cmp::Ordering] is an enum returned by the
-//!   main functions of [`Ord`] and [`PartialOrd`], and describes an ordering.
-//! * [`Reverse`][cmp::Reverse] is a struct that allows you to easily reverse
-//!   an ordering.
-//! * [`max`][cmp::max] and [`min`][cmp::min] are functions that build off of
-//!   [`Ord`] and allow you to find the maximum or minimum of two values.
+//! * [`Ordering`] is an enum returned by the main functions of [`Ord`] and
+//!   [`PartialOrd`], and describes an ordering.
+//! * [`Reverse`] is a struct that allows you to easily reverse an ordering.
+//! * [`max`] and [`min`] are functions that build off of [`Ord`] and allow you
+//!   to find the maximum or minimum of two values.
 //!
 //! For more details, see the respective documentation of each item in the list.
+//!
+//! [`Eq`]: trait.Eq.html
+//! [`PartialEq`]: trait.PartialEq.html
+//! [`Ord`]: trait.Ord.html
+//! [`PartialOrd`]: trait.PartialOrd.html
+//! [`Ordering`]: enum.Ordering.html
+//! [`Reverse`]: struct.Reverse.html
+//! [`max`]: fn.max.html
+//! [`min`]: fn.min.html
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
@@ -202,7 +210,6 @@ pub trait PartialEq<Rhs: ?Sized = Self> {
 
 /// Derive macro generating an impl of the trait `PartialEq`.
 #[rustc_builtin_macro]
-#[cfg_attr(boostrap_stdarch_ignore_this, rustc_macro_transparency = "semitransparent")]
 #[stable(feature = "builtin_macro_prelude", since = "1.38.0")]
 #[allow_internal_unstable(core_intrinsics)]
 pub macro PartialEq($item:item) { /* compiler built-in */ }
@@ -265,7 +272,6 @@ pub trait Eq: PartialEq<Self> {
 
 /// Derive macro generating an impl of the trait `Eq`.
 #[rustc_builtin_macro]
-#[cfg_attr(boostrap_stdarch_ignore_this, rustc_macro_transparency = "semitransparent")]
 #[stable(feature = "builtin_macro_prelude", since = "1.38.0")]
 #[allow_internal_unstable(core_intrinsics, derive_eq)]
 pub macro Eq($item:item) { /* compiler built-in */ }
@@ -562,7 +568,7 @@ pub trait Ord: Eq + PartialOrd<Self> {
     #[inline]
     fn max(self, other: Self) -> Self
     where Self: Sized {
-        if other >= self { other } else { self }
+        max_by(self, other, Ord::cmp)
     }
 
     /// Compares and returns the minimum of two values.
@@ -579,7 +585,7 @@ pub trait Ord: Eq + PartialOrd<Self> {
     #[inline]
     fn min(self, other: Self) -> Self
     where Self: Sized {
-        if self <= other { self } else { other }
+        min_by(self, other, Ord::cmp)
     }
 
     /// Restrict a value to a certain interval.
@@ -616,7 +622,6 @@ pub trait Ord: Eq + PartialOrd<Self> {
 
 /// Derive macro generating an impl of the trait `Ord`.
 #[rustc_builtin_macro]
-#[cfg_attr(boostrap_stdarch_ignore_this, rustc_macro_transparency = "semitransparent")]
 #[stable(feature = "builtin_macro_prelude", since = "1.38.0")]
 #[allow_internal_unstable(core_intrinsics)]
 pub macro Ord($item:item) { /* compiler built-in */ }
@@ -865,7 +870,6 @@ pub trait PartialOrd<Rhs: ?Sized = Self>: PartialEq<Rhs> {
 
 /// Derive macro generating an impl of the trait `PartialOrd`.
 #[rustc_builtin_macro]
-#[cfg_attr(boostrap_stdarch_ignore_this, rustc_macro_transparency = "semitransparent")]
 #[stable(feature = "builtin_macro_prelude", since = "1.38.0")]
 #[allow_internal_unstable(core_intrinsics)]
 pub macro PartialOrd($item:item) { /* compiler built-in */ }
@@ -890,6 +894,49 @@ pub fn min<T: Ord>(v1: T, v2: T) -> T {
     v1.min(v2)
 }
 
+/// Returns the minimum of two values with respect to the specified comparison function.
+///
+/// Returns the first argument if the comparison determines them to be equal.
+///
+/// # Examples
+///
+/// ```
+/// #![feature(cmp_min_max_by)]
+///
+/// use std::cmp;
+///
+/// assert_eq!(cmp::min_by(-2, 1, |x: &i32, y: &i32| x.abs().cmp(&y.abs())), 1);
+/// assert_eq!(cmp::min_by(-2, 2, |x: &i32, y: &i32| x.abs().cmp(&y.abs())), -2);
+/// ```
+#[inline]
+#[unstable(feature = "cmp_min_max_by", issue = "64460")]
+pub fn min_by<T, F: FnOnce(&T, &T) -> Ordering>(v1: T, v2: T, compare: F) -> T {
+    match compare(&v1, &v2) {
+        Ordering::Less | Ordering::Equal => v1,
+        Ordering::Greater => v2,
+    }
+}
+
+/// Returns the element that gives the minimum value from the specified function.
+///
+/// Returns the first argument if the comparison determines them to be equal.
+///
+/// # Examples
+///
+/// ```
+/// #![feature(cmp_min_max_by)]
+///
+/// use std::cmp;
+///
+/// assert_eq!(cmp::min_by_key(-2, 1, |x: &i32| x.abs()), 1);
+/// assert_eq!(cmp::min_by_key(-2, 2, |x: &i32| x.abs()), -2);
+/// ```
+#[inline]
+#[unstable(feature = "cmp_min_max_by", issue = "64460")]
+pub fn min_by_key<T, F: FnMut(&T) -> K, K: Ord>(v1: T, v2: T, mut f: F) -> T {
+    min_by(v1, v2, |v1, v2| f(v1).cmp(&f(v2)))
+}
+
 /// Compares and returns the maximum of two values.
 ///
 /// Returns the second argument if the comparison determines them to be equal.
@@ -908,6 +955,49 @@ pub fn min<T: Ord>(v1: T, v2: T) -> T {
 #[stable(feature = "rust1", since = "1.0.0")]
 pub fn max<T: Ord>(v1: T, v2: T) -> T {
     v1.max(v2)
+}
+
+/// Returns the maximum of two values with respect to the specified comparison function.
+///
+/// Returns the second argument if the comparison determines them to be equal.
+///
+/// # Examples
+///
+/// ```
+/// #![feature(cmp_min_max_by)]
+///
+/// use std::cmp;
+///
+/// assert_eq!(cmp::max_by(-2, 1, |x: &i32, y: &i32| x.abs().cmp(&y.abs())), -2);
+/// assert_eq!(cmp::max_by(-2, 2, |x: &i32, y: &i32| x.abs().cmp(&y.abs())), 2);
+/// ```
+#[inline]
+#[unstable(feature = "cmp_min_max_by", issue = "64460")]
+pub fn max_by<T, F: FnOnce(&T, &T) -> Ordering>(v1: T, v2: T, compare: F) -> T {
+    match compare(&v1, &v2) {
+        Ordering::Less | Ordering::Equal => v2,
+        Ordering::Greater => v1,
+    }
+}
+
+/// Returns the element that gives the maximum value from the specified function.
+///
+/// Returns the second argument if the comparison determines them to be equal.
+///
+/// # Examples
+///
+/// ```
+/// #![feature(cmp_min_max_by)]
+///
+/// use std::cmp;
+///
+/// assert_eq!(cmp::max_by_key(-2, 1, |x: &i32| x.abs()), -2);
+/// assert_eq!(cmp::max_by_key(-2, 2, |x: &i32| x.abs()), 2);
+/// ```
+#[inline]
+#[unstable(feature = "cmp_min_max_by", issue = "64460")]
+pub fn max_by_key<T, F: FnMut(&T) -> K, K: Ord>(v1: T, v2: T, mut f: F) -> T {
+    max_by(v1, v2, |v1, v2| f(v1).cmp(&f(v2)))
 }
 
 // Implementation of PartialEq, Eq, PartialOrd and Ord for primitive types
@@ -1015,8 +1105,8 @@ mod impls {
                     // The order here is important to generate more optimal assembly.
                     // See <https://github.com/rust-lang/rust/issues/63758> for more info.
                     if *self < *other { Less }
-                    else if *self > *other { Greater }
-                    else { Equal }
+                    else if *self == *other { Equal }
+                    else { Greater }
                 }
             }
         )*)

@@ -12,9 +12,9 @@ doctest = false
 
 [dependencies]
 bitflags = "1.0"
-indexmap = "1"
 log = "0.4"
 syntax = { path = "../libsyntax" }
+syntax_expand = { path = "../libsyntax_expand" }
 rustc = { path = "../librustc" }
 arena = { path = "../libarena" }
 errors = { path = "../librustc_errors", package = "rustc_errors" }

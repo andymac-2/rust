@@ -4,14 +4,14 @@
 use syntax::ast::*;
 use syntax::attr;
 use syntax::edition::Edition;
-use syntax::ext::base::{Resolver, NamedSyntaxExtension};
+use syntax_expand::base::{Resolver, NamedSyntaxExtension};
 use syntax::parse::token;
 use syntax::ptr::P;
 use syntax::source_map::respan;
 use syntax::symbol::sym;
 use syntax::tokenstream::*;
 use syntax_pos::{Span, DUMMY_SP};
-use syntax_pos::hygiene::{ExpnData, ExpnKind, MacroKind};
+use syntax_pos::hygiene::{ExpnData, ExpnKind, AstPass};
 
 use std::mem;
 
@@ -20,7 +20,7 @@ fn plugin_macro_def(name: Name, span: Span) -> P<Item> {
         attr::mk_word_item(Ident::new(sym::rustc_builtin_macro, span)));
 
     let parens: TreeAndJoint = TokenTree::Delimited(
-        DelimSpan::from_single(span), token::Paren, TokenStream::empty()
+        DelimSpan::from_single(span), token::Paren, TokenStream::default()
     ).into();
     let trees = vec![parens.clone(), TokenTree::token(token::FatArrow, span).into(), parens];
 
@@ -28,7 +28,7 @@ fn plugin_macro_def(name: Name, span: Span) -> P<Item> {
         ident: Ident::new(name, span),
         attrs: vec![rustc_builtin_macro],
         id: DUMMY_NODE_ID,
-        node: ItemKind::MacroDef(MacroDef { tokens: TokenStream::new(trees), legacy: true }),
+        kind: ItemKind::MacroDef(MacroDef { tokens: TokenStream::new(trees), legacy: true }),
         vis: respan(span, VisibilityKind::Inherited),
         span: span,
         tokens: None,
@@ -44,7 +44,7 @@ pub fn inject(
     if !named_exts.is_empty() {
         let mut extra_items = Vec::new();
         let span = DUMMY_SP.fresh_expansion(ExpnData::allow_unstable(
-            ExpnKind::Macro(MacroKind::Attr, sym::plugin), DUMMY_SP, edition,
+            ExpnKind::AstPass(AstPass::PluginMacroDefs), DUMMY_SP, edition,
             [sym::rustc_attrs][..].into(),
         ));
         for (name, ext) in named_exts {

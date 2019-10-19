@@ -6,10 +6,10 @@ use crate::foreign_modules;
 use crate::schema;
 
 use rustc::ty::query::QueryConfig;
-use rustc::middle::cstore::{CrateStore, DepKind,
-                            EncodedMetadata, NativeLibraryKind};
+use rustc::middle::cstore::{CrateSource, CrateStore, DepKind, EncodedMetadata, NativeLibraryKind};
 use rustc::middle::exported_symbols::ExportedSymbol;
 use rustc::middle::stability::DeprecationEntry;
+use rustc::middle::dependency_format::Linkage;
 use rustc::hir::def;
 use rustc::hir;
 use rustc::session::{CrateDisambiguator, Session};
@@ -30,13 +30,12 @@ use syntax::ast;
 use syntax::attr;
 use syntax::source_map;
 use syntax::edition::Edition;
-use syntax::ext::base::{SyntaxExtension, SyntaxExtensionKind};
-use syntax::ext::proc_macro::BangProcMacro;
 use syntax::parse::source_file_to_stream;
 use syntax::parse::parser::emit_unclosed_delims;
-use syntax::symbol::{Symbol, sym};
+use syntax::source_map::Spanned;
+use syntax::symbol::Symbol;
 use syntax_pos::{Span, FileName};
-use rustc_data_structures::bit_set::BitSet;
+use rustc_index::bit_set::BitSet;
 
 macro_rules! provide {
     (<$lt:tt> $tcx:ident, $def_id:ident, $other:ident, $cdata:ident,
@@ -48,23 +47,22 @@ macro_rules! provide {
                 $tcx: TyCtxt<$lt>,
                 def_id_arg: T,
             ) -> <ty::queries::$name<$lt> as QueryConfig<$lt>>::Value {
+                let _prof_timer =
+                    $tcx.prof.generic_activity("metadata_decode_entry");
+
                 #[allow(unused_variables)]
                 let ($def_id, $other) = def_id_arg.into_args();
                 assert!(!$def_id.is_local());
 
-                let def_path_hash = $tcx.def_path_hash(DefId {
-                    krate: $def_id.krate,
-                    index: CRATE_DEF_INDEX
-                });
-                let dep_node = def_path_hash
-                    .to_dep_node(rustc::dep_graph::DepKind::CrateMetadata);
-                // The DepNodeIndex of the DepNode::CrateMetadata should be
-                // cached somewhere, so that we can use read_index().
-                $tcx.dep_graph.read(dep_node);
-
                 let $cdata = $tcx.crate_data_as_rc_any($def_id.krate);
                 let $cdata = $cdata.downcast_ref::<cstore::CrateMetadata>()
                     .expect("CrateStore created data is not a CrateMetadata");
+
+                if $tcx.dep_graph.is_fully_enabled() {
+                    let crate_dep_node_index = $cdata.get_crate_dep_node_index($tcx);
+                    $tcx.dep_graph.read_index(crate_dep_node_index);
+                }
+
                 $compute
             })*
 
@@ -99,11 +97,9 @@ provide! { <'tcx> tcx, def_id, other, cdata,
     generics_of => {
         tcx.arena.alloc(cdata.get_generics(def_id.index, tcx.sess))
     }
-    predicates_of => { tcx.arena.alloc(cdata.get_predicates(def_id.index, tcx)) }
-    predicates_defined_on => {
-        tcx.arena.alloc(cdata.get_predicates_defined_on(def_id.index, tcx))
-    }
-    super_predicates_of => { tcx.arena.alloc(cdata.get_super_predicates(def_id.index, tcx)) }
+    predicates_of => { cdata.get_predicates(def_id.index, tcx) }
+    predicates_defined_on => { cdata.get_predicates_defined_on(def_id.index, tcx) }
+    super_predicates_of => { cdata.get_super_predicates(def_id.index, tcx) }
     trait_def => {
         tcx.arena.alloc(cdata.get_trait_def(def_id.index, tcx.sess))
     }
@@ -127,30 +123,15 @@ provide! { <'tcx> tcx, def_id, other, cdata,
             bug!("coerce_unsized_info: `{:?}` is missing its info", def_id);
         })
     }
-    optimized_mir => {
-        let mir = cdata.maybe_get_optimized_mir(tcx, def_id.index).unwrap_or_else(|| {
-            bug!("get_optimized_mir: missing MIR for `{:?}`", def_id)
-        });
-
-        let mir = tcx.arena.alloc(mir);
-
-        mir
-    }
-    promoted_mir => {
-        let promoted = cdata.maybe_get_promoted_mir(tcx, def_id.index).unwrap_or_else(|| {
-            bug!("get_promoted_mir: missing promoted MIR for `{:?}`", def_id)
-        });
-
-        let promoted = tcx.arena.alloc(promoted);
-
-        promoted
-    }
+    optimized_mir => { tcx.arena.alloc(cdata.get_optimized_mir(tcx, def_id.index)) }
+    promoted_mir => { tcx.arena.alloc(cdata.get_promoted_mir(tcx, def_id.index)) }
     mir_const_qualif => {
         (cdata.mir_const_qualif(def_id.index), tcx.arena.alloc(BitSet::new_empty(0)))
     }
     fn_sig => { cdata.fn_sig(def_id.index, tcx) }
     inherent_impls => { cdata.get_inherent_implementations_for_type(tcx, def_id.index) }
     is_const_fn_raw => { cdata.is_const_fn_raw(def_id.index) }
+    asyncness => { cdata.asyncness(def_id.index) }
     is_foreign_item => { cdata.is_foreign_item(def_id.index) }
     static_mutability => { cdata.static_mutability(def_id.index) }
     def_kind => { cdata.def_kind(def_id.index) }
@@ -166,13 +147,10 @@ provide! { <'tcx> tcx, def_id, other, cdata,
     // a `fn` when encoding, so the dep-tracking wouldn't work.
     // This is only used by rustdoc anyway, which shouldn't have
     // incremental recompilation ever enabled.
-    fn_arg_names => { cdata.get_fn_arg_names(def_id.index) }
+    fn_arg_names => { cdata.get_fn_param_names(def_id.index) }
     rendered_const => { cdata.get_rendered_const(def_id.index) }
     impl_parent => { cdata.get_parent_impl(def_id.index) }
     trait_of_item => { cdata.get_trait_of_item(def_id.index) }
-    const_is_rvalue_promotable_to_static => {
-        cdata.const_is_rvalue_promotable_to_static(def_id.index)
-    }
     is_mir_available => { cdata.is_item_mir_available(def_id.index) }
 
     dylib_dependency_formats => { cdata.get_dylib_dependency_formats(tcx) }
@@ -236,7 +214,7 @@ provide! { <'tcx> tcx, def_id, other, cdata,
         let r = *cdata.dep_kind.lock();
         r
     }
-    crate_name => { cdata.name }
+    crate_name => { cdata.root.name }
     item_children => {
         let mut result = SmallVec::<[_; 8]>::new();
         cdata.each_child_of_item(def_id.index, |child| result.push(child), tcx.sess);
@@ -244,11 +222,12 @@ provide! { <'tcx> tcx, def_id, other, cdata,
     }
     defined_lib_features => { cdata.get_lib_features(tcx) }
     defined_lang_items => { cdata.get_lang_items(tcx) }
+    diagnostic_items => { cdata.get_diagnostic_items(tcx) }
     missing_lang_items => { cdata.get_missing_lang_items(tcx) }
 
     missing_extern_crate_item => {
         let r = match *cdata.extern_crate.borrow() {
-            Some(extern_crate) if !extern_crate.direct => true,
+            Some(extern_crate) if !extern_crate.is_direct() => true,
             _ => false,
         };
         r
@@ -256,7 +235,30 @@ provide! { <'tcx> tcx, def_id, other, cdata,
 
     used_crate_source => { Lrc::new(cdata.source.clone()) }
 
-    exported_symbols => { Arc::new(cdata.exported_symbols(tcx)) }
+    exported_symbols => {
+        let mut syms = cdata.exported_symbols(tcx);
+
+        // When linked into a dylib crates don't export their generic symbols,
+        // so if that's happening then we can't load upstream monomorphizations
+        // from this crate.
+        let formats = tcx.dependency_formats(LOCAL_CRATE);
+        let remove_generics = formats.iter().any(|(_ty, list)| {
+            match list.get(def_id.krate.as_usize() - 1) {
+                Some(Linkage::IncludedFromDylib) | Some(Linkage::Dynamic) => true,
+                _ => false,
+            }
+        });
+        if remove_generics {
+            syms.retain(|(sym, _threshold)| {
+                match sym {
+                    ExportedSymbol::Generic(..) => false,
+                    _ => return true,
+                }
+            });
+        }
+
+        Arc::new(syms)
+    }
 }
 
 pub fn provide(providers: &mut Providers<'_>) {
@@ -265,7 +267,11 @@ pub fn provide(providers: &mut Providers<'_>) {
     // resolve! Does this work? Unsure! That's what the issue is about
     *providers = Providers {
         is_dllimport_foreign_item: |tcx, id| {
-            tcx.native_library_kind(id) == Some(NativeLibraryKind::NativeUnknown)
+            match tcx.native_library_kind(id) {
+                Some(NativeLibraryKind::NativeUnknown) |
+                Some(NativeLibraryKind::NativeRawDylib) => true,
+                _ => false,
+            }
         },
         is_statically_included_foreign_item: |tcx, id| {
             match tcx.native_library_kind(id) {
@@ -387,6 +393,11 @@ pub fn provide(providers: &mut Providers<'_>) {
             tcx.arena.alloc(visible_parent_map)
         },
 
+        dependency_formats: |tcx, cnum| {
+            assert_eq!(cnum, LOCAL_CRATE);
+            Lrc::new(crate::dependency_format::calculate(tcx))
+        },
+
         ..*providers
     };
 }
@@ -400,26 +411,12 @@ impl cstore::CStore {
         }
     }
 
-    pub fn dep_kind_untracked(&self, cnum: CrateNum) -> DepKind {
-        let data = self.get_crate_data(cnum);
-        let r = *data.dep_kind.lock();
-        r
-    }
-
     pub fn crate_edition_untracked(&self, cnum: CrateNum) -> Edition {
         self.get_crate_data(cnum).root.edition
     }
 
-    pub fn struct_field_names_untracked(&self, def: DefId) -> Vec<ast::Name> {
-        self.get_crate_data(def.krate).get_struct_field_names(def.index)
-    }
-
-    pub fn ctor_kind_untracked(&self, def: DefId) -> def::CtorKind {
-        self.get_crate_data(def.krate).get_ctor_kind(def.index)
-    }
-
-    pub fn item_attrs_untracked(&self, def: DefId, sess: &Session) -> Lrc<[ast::Attribute]> {
-        self.get_crate_data(def.krate).get_item_attrs(def.index, sess)
+    pub fn struct_field_names_untracked(&self, def: DefId, sess: &Session) -> Vec<Spanned<Symbol>> {
+        self.get_crate_data(def.krate).get_struct_field_names(def.index, sess)
     }
 
     pub fn item_children_untracked(
@@ -434,22 +431,15 @@ impl cstore::CStore {
     }
 
     pub fn load_macro_untracked(&self, id: DefId, sess: &Session) -> LoadedMacro {
+        let _prof_timer = sess.prof.generic_activity("metadata_load_macro");
+
         let data = self.get_crate_data(id.krate);
         if data.is_proc_macro_crate() {
-            return LoadedMacro::ProcMacro(data.get_proc_macro(id.index, sess).ext);
-        } else if data.name == sym::proc_macro && data.item_name(id.index) == sym::quote {
-            let client = proc_macro::bridge::client::Client::expand1(proc_macro::quote);
-            let kind = SyntaxExtensionKind::Bang(Box::new(BangProcMacro { client }));
-            let ext = SyntaxExtension {
-                allow_internal_unstable: Some([sym::proc_macro_def_site][..].into()),
-                ..SyntaxExtension::default(kind, data.root.edition)
-            };
-            return LoadedMacro::ProcMacro(Lrc::new(ext));
+            return LoadedMacro::ProcMacro(data.load_proc_macro(id.index, sess));
         }
 
         let def = data.get_macro(id.index);
-        let macro_full_name = data.def_path(id.index)
-            .to_string_friendly(|_| data.imported_name);
+        let macro_full_name = data.def_path(id.index).to_string_friendly(|_| data.root.name);
         let source_name = FileName::Macros(macro_full_name);
 
         let source_file = sess.parse_sess.source_map().new_source_file(source_name, def.body);
@@ -469,11 +459,12 @@ impl cstore::CStore {
             .insert(local_span, (name.to_string(), data.get_span(id.index, sess)));
 
         LoadedMacro::MacroDef(ast::Item {
-            ident: ast::Ident::from_str(&name.as_str()),
+            // FIXME: cross-crate hygiene
+            ident: ast::Ident::with_dummy_span(name.as_symbol()),
             id: ast::DUMMY_NODE_ID,
             span: local_span,
             attrs: attrs.iter().cloned().collect(),
-            node: ast::ItemKind::MacroDef(ast::MacroDef {
+            kind: ast::ItemKind::MacroDef(ast::MacroDef {
                 tokens: body.into(),
                 legacy: def.legacy,
             }),
@@ -484,6 +475,10 @@ impl cstore::CStore {
 
     pub fn associated_item_cloned_untracked(&self, def: DefId) -> ty::AssocItem {
         self.get_crate_data(def.krate).get_associated_item(def.index)
+    }
+
+    pub fn crate_source_untracked(&self, cnum: CrateNum) -> CrateSource {
+        self.get_crate_data(cnum).source.clone()
     }
 }
 
@@ -498,7 +493,7 @@ impl CrateStore for cstore::CStore {
 
     fn crate_name_untracked(&self, cnum: CrateNum) -> Symbol
     {
-        self.get_crate_data(cnum).name
+        self.get_crate_data(cnum).root.name
     }
 
     fn crate_is_private_dep_untracked(&self, cnum: CrateNum) -> bool {
@@ -519,20 +514,10 @@ impl CrateStore for cstore::CStore {
     /// parent `DefId` as well as some idea of what kind of data the
     /// `DefId` refers to.
     fn def_key(&self, def: DefId) -> DefKey {
-        // Note: loading the def-key (or def-path) for a def-id is not
-        // a *read* of its metadata. This is because the def-id is
-        // really just an interned shorthand for a def-path, which is the
-        // canonical name for an item.
-        //
-        // self.dep_graph.read(DepNode::MetaData(def));
         self.get_crate_data(def.krate).def_key(def.index)
     }
 
     fn def_path(&self, def: DefId) -> DefPath {
-        // See `Note` above in `def_key()` for why this read is
-        // commented out:
-        //
-        // self.dep_graph.read(DepNode::MetaData(def));
         self.get_crate_data(def.krate).def_path(def.index)
     }
 
@@ -549,11 +534,6 @@ impl CrateStore for cstore::CStore {
         let mut result = vec![];
         self.iter_crate_data(|cnum, _| result.push(cnum));
         result
-    }
-
-    fn extern_mod_stmt_cnum_untracked(&self, emod_id: ast::NodeId) -> Option<CrateNum>
-    {
-        self.do_extern_mod_stmt_cnum(emod_id)
     }
 
     fn postorder_cnums_untracked(&self) -> Vec<CrateNum> {
